@@ -1,0 +1,72 @@
+diff --git a/libc/bionic/pthread_internal.cpp b/libc/bionic/pthread_internal.cpp
+index 6fddefe..a36b18d 100644
+--- a/libc/bionic/pthread_internal.cpp
++++ b/libc/bionic/pthread_internal.cpp
+@@ -101,17 +101,24 @@ pthread_internal_t* __pthread_internal_find(pthread_t thread_id, const char* cal
+   }
+ 
+   // Historically we'd return null, but
+-  if (android_get_application_target_sdk_version() >= __ANDROID_API_O__) {
+-    if (thread == nullptr) {
+-      // This seems to be a common mistake, and it's relatively harmless because
+-      // there will never be a valid thread at address 0, whereas other invalid
+-      // addresses might sometimes contain threads or things that look enough like
+-      // threads for us to do some real damage by continuing.
+-      // TODO: try getting rid of this when Treble lets us keep vendor blobs on an old API level.
+-      async_safe_format_log(ANDROID_LOG_WARN, "libc", "invalid pthread_t (0) passed to %s", caller);
+-    } else {
+-      async_safe_fatal("invalid pthread_t %p passed to %s", thread, caller);
+-    }
+-  }
++  //
++  // golden: bu satirdaki TODO'nun tarif ettigi durum tam olarak bu cihaz.
++  // Samsung'un 2013 tarihli libsecril-client.so'su Disconnect_RILD() icinde
++  // zaten cikmis bir thread'e pthread_join cagiriyor; Android O oncesi bionic
++  // buna ESRCH donerdi, bu bionic async_safe_fatal ile sureci olduruyor.
++  // Olculdu (25 Agustos, tombstone_43/45):
++  //   audioserver  SIGABRT
++  //   abort <- __pthread_internal_find <- pthread_join <- Disconnect_RILD
++  //         <- CloseClient_RILD
++  // audioserver bu yuzden dongude cokuyordu.  Bu agacta blob'u surece ozel bir
++  // target SDK'ya baglama yolu yok (PROCESS_SDK_VERSION_OVERRIDE bu surumde
++  // yok), o yuzden kontrol O oncesi davranisa donduruldu: uyar ve nullptr don,
++  // cagiran da ESRCH alsin.
++  //
++  // Bedeli: gecersiz bir pthread_t artik hemen tespit edilmiyor.  Bu agacta
++  // yasamak zorunda oldugumuz 2013 blob'lariyla, hatayi erken yakalamak
++  // ugruna sureci oldurmek kotu takas.
++  async_safe_format_log(ANDROID_LOG_WARN, "libc",
++                        "invalid pthread_t %p passed to %s", thread, caller);
+   return nullptr;
+ }
+diff --git a/linker/linker.cpp b/linker/linker.cpp
+index 6941fde..ee80547 100644
+--- a/linker/linker.cpp
++++ b/linker/linker.cpp
+@@ -3971,14 +3971,18 @@ bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t&
+ 
+ #if !defined(__LP64__)
+   if (has_text_relocations) {
+-    // Fail if app is targeting M or above.
+-    int app_target_api_level = get_application_target_sdk_version();
+-    if (app_target_api_level >= __ANDROID_API_M__) {
+-      DL_ERR_AND_LOG("\"%s\" has text relocations (https://android.googlesource.com/platform/"
+-                     "bionic/+/master/android-changes-for-ndk-developers.md#Text-Relocations-"
+-                     "Enforced-for-API-level-23)", get_realpath());
+-      return false;
+-    }
++    // Upstream fails here when the target API level is 23 or above.  That check
++    // is dropped on this device: every vendor blob it has is from 2013 and 72 of
++    // them carry text relocations, including gralloc.montblanc, hwcomposer,
++    // libEGL_mali and the GLES drivers.  Refusing them means surfaceflinger has
++    // no graphics implementation at all - the handset boots to a black screen
++    // with no bootanimation and no UI - and there are no newer blobs to move to.
++    //
++    // The permissive path below is upstream's own, unchanged: unprotect the
++    // segments, apply the relocations, and phdr_table_protect_segments() puts
++    // them back.  The cost is that those mappings are briefly writable and
++    // executable, which is a real weakening of W^X; it is accepted here because
++    // this is a personal lab handset and the alternative is no display driver.
+     // Make segments writable to allow text relocations to work properly. We will later call
+     // phdr_table_protect_segments() after all of them are applied.
+     DL_WARN_documented_change(__ANDROID_API_M__,

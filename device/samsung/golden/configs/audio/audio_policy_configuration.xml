@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Audio policy configuration for golden (GT-I8190), converted from the
+     legacy configs/etc/audio_policy.conf.
+
+     BoardConfig.mk sets USE_XML_AUDIO_POLICY_CONF := 1, but the device only
+     ever shipped the legacy .conf, so nothing under /odm/etc, /vendor/etc or
+     /system/etc matched what AudioPolicyManager and the policy engine look
+     for.  parseLegacyVolumes() then returned BAD_VALUE, the engine's volume
+     group list stayed empty, and loadProductStrategies() dereferenced
+     end(volumeGroups) - audioserver died in a loop with SIGSEGV in
+     VolumeGroup::addSupportedStream.
+
+     Samsung's AUDIO_DEVICE_*_EXTERNAL_TMS ports from the legacy file are
+     deliberately absent: those enum values do not exist in AOSP's audio.h and
+     the XML parser rejects the whole document on an unknown type.
+-->
+<audioPolicyConfiguration version="1.0" xmlns:xi="http://www.w3.org/2001/XInclude">
+    <globalConfiguration speaker_drc_enabled="false"/>
+
+    <modules>
+        <module name="primary" halVersion="2.0">
+            <attachedDevices>
+                <item>Earpiece</item>
+                <item>Speaker</item>
+                <item>Built-In Mic</item>
+                <item>Built-In Back Mic</item>
+                <item>Voice Call In</item>
+            </attachedDevices>
+            <defaultOutputDevice>Speaker</defaultOutputDevice>
+            <mixPorts>
+                <mixPort name="primary output" role="source"
+                         flags="AUDIO_OUTPUT_FLAG_PRIMARY">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="44100"
+                             channelMasks="AUDIO_CHANNEL_OUT_STEREO"/>
+                </mixPort>
+                <mixPort name="primary input" role="sink">
+                    <profile name="" format="AUDIO_FORMAT_PCM_16_BIT"
+                             samplingRates="8000,11025,16000,22050,24000,32000,44100,48000"
+                             channelMasks="AUDIO_CHANNEL_IN_MONO,AUDIO_CHANNEL_IN_STEREO"/>
+                </mixPort>
+            </mixPorts>
+            <devicePorts>
+                <devicePort tagName="Earpiece" type="AUDIO_DEVICE_OUT_EARPIECE" role="sink"/>
+                <devicePort tagName="Speaker" type="AUDIO_DEVICE_OUT_SPEAKER" role="sink"/>
+                <devicePort tagName="Wired Headset" type="AUDIO_DEVICE_OUT_WIRED_HEADSET" role="sink"/>
+                <devicePort tagName="Wired Headphones" type="AUDIO_DEVICE_OUT_WIRED_HEADPHONE" role="sink"/>
+                <devicePort tagName="BT SCO" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO" role="sink"/>
+                <devicePort tagName="BT SCO Headset" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET" role="sink"/>
+                <devicePort tagName="BT SCO Car Kit" type="AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT" role="sink"/>
+                <devicePort tagName="Dock Headset" type="AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET" role="sink"/>
+
+                <devicePort tagName="Built-In Mic" type="AUDIO_DEVICE_IN_BUILTIN_MIC" role="source"/>
+                <devicePort tagName="Built-In Back Mic" type="AUDIO_DEVICE_IN_BACK_MIC" role="source"/>
+                <devicePort tagName="Wired Headset Mic" type="AUDIO_DEVICE_IN_WIRED_HEADSET" role="source"/>
+                <devicePort tagName="BT SCO Headset Mic" type="AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET" role="source"/>
+                <devicePort tagName="Voice Call In" type="AUDIO_DEVICE_IN_VOICE_CALL" role="source"/>
+                <devicePort tagName="FM Tuner" type="AUDIO_DEVICE_IN_FM_TUNER" role="source"/>
+            </devicePorts>
+            <routes>
+                <route type="mix" sink="Earpiece"          sources="primary output"/>
+                <route type="mix" sink="Speaker"           sources="primary output"/>
+                <route type="mix" sink="Wired Headset"     sources="primary output"/>
+                <route type="mix" sink="Wired Headphones"  sources="primary output"/>
+                <route type="mix" sink="BT SCO"            sources="primary output"/>
+                <route type="mix" sink="BT SCO Headset"    sources="primary output"/>
+                <route type="mix" sink="BT SCO Car Kit"    sources="primary output"/>
+                <route type="mix" sink="Dock Headset"      sources="primary output"/>
+                <route type="mix" sink="primary input"
+                       sources="Built-In Mic,Built-In Back Mic,Wired Headset Mic,BT SCO Headset Mic,Voice Call In,FM Tuner"/>
+            </routes>
+        </module>
+
+        <xi:include href="a2dp_audio_policy_configuration.xml"/>
+        <xi:include href="usb_audio_policy_configuration.xml"/>
+        <xi:include href="r_submix_audio_policy_configuration.xml"/>
+    </modules>
+
+    <xi:include href="audio_policy_volumes.xml"/>
+    <xi:include href="default_volume_tables.xml"/>
+</audioPolicyConfiguration>

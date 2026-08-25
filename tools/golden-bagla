@@ -1,0 +1,64 @@
+#!/bin/bash
+# golden'a USB uzerinden baglan.  Tek komut, her seferinde ayni.
+#
+# Neden gerekli: f_rndis her bind'da rastgele bir host MAC uretiyor, o yuzden
+# arayuz adi her seferinde degisiyor (enx121aeede222a, enxfa307a009c62,
+# enxba392e48b800 ...) ve adres kayboluyor.  Arayuzu adiyla degil SURUCUSUYLE
+# buluyoruz.
+set -uo pipefail
+A=$HOME/bin/adb
+IP_TEL=192.168.42.2
+IP_HOST=192.168.42.1
+
+arayuz() {
+  local d
+  for d in /sys/class/net/*/; do
+    [ -e "$d/device/driver" ] || continue
+    case "$(basename "$(readlink -f "$d/device/driver")")" in
+      rndis_host|cdc_ether|rndis_wlan) basename "$d"; return 0;;
+    esac
+  done
+  return 1
+}
+
+I=$(arayuz) || { echo "rndis arayuzu yok - telefon USB'de mi, gadget rndis iceriyor mu?"; exit 1; }
+echo "arayuz: $I"
+sudo ip addr flush dev "$I" 2>/dev/null
+sudo ip addr add "$IP_HOST/24" dev "$I" 2>/dev/null
+sudo ip link set "$I" up
+for i in 1 2 3 4 5; do
+  ping -c1 -W1 "$IP_TEL" >/dev/null 2>&1 && break
+  # veri yolu tikanmissa host surucusunu tazele: telefona dokunmadan duzeliyor
+  if [ "$i" = 3 ]; then
+    B=$(basename "$(readlink -f /sys/class/net/$I/device)")
+    echo "  ping yok -> rndis_host yeniden baglaniyor ($B)"
+    echo -n "$B" | sudo tee /sys/bus/usb/drivers/rndis_host/unbind >/dev/null 2>&1
+    sleep 1
+    echo -n "$B" | sudo tee /sys/bus/usb/drivers/rndis_host/bind >/dev/null 2>&1
+    sleep 3
+    I=$(arayuz) || exit 1
+    sudo ip addr flush dev "$I" 2>/dev/null
+    sudo ip addr add "$IP_HOST/24" dev "$I" 2>/dev/null
+    sudo ip link set "$I" up
+  fi
+  sleep 1
+done
+ping -c1 -W1 "$IP_TEL" >/dev/null 2>&1 || { echo "telefon ping'e cevap vermiyor"; exit 1; }
+echo "ping: tamam"
+# "already connected" yalanci olabilir: sunucuda olu bir kayit durabiliyor ve
+# adb "already connected" deyip ardindan "device offline" veriyor.  O yuzden
+# baglanti her zaman GERCEK bir komutla sinaniyor, basarisizsa sunucu bastan
+# kaldiriliyor.
+bagli_mi() { timeout 12 $A -s "$IP_TEL:5555" shell true >/dev/null 2>&1; }
+
+$A disconnect "$IP_TEL:5555" >/dev/null 2>&1
+timeout 20 $A connect "$IP_TEL:5555" >/dev/null 2>&1
+sleep 1
+if bagli_mi; then
+  echo "adb: HAZIR"
+else
+  echo "  olu kayit -> adb sunucusu yeniden baslatiliyor"
+  $A kill-server >/dev/null 2>&1; sleep 2
+  timeout 20 $A connect "$IP_TEL:5555" >/dev/null 2>&1; sleep 2
+  bagli_mi && echo "adb: HAZIR" || { echo "adb: baglanamadi"; exit 1; }
+fi

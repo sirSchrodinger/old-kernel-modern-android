@@ -1,0 +1,21 @@
+diff --git a/wait_for_keymaster.rc b/wait_for_keymaster.rc
+index 9e83a93..d2e3029 100644
+--- a/wait_for_keymaster.rc
++++ b/wait_for_keymaster.rc
+@@ -1,5 +1,16 @@
++# oneshot added.  Upstream leaves it off because AOSP devices only ever reach
++# this service through "exec_start wait_for_keymaster", which runs it once and
++# waits.  This device tree instead does "class_start default"
++# (init.samsunggolden.rc), which sweeps up every classless service - and
++# without oneshot init restarts wait_for_keymaster every time it exits, so it
++# respawned continuously for the whole boot at priority -20 with realtime
++# ioprio.  That is the most aggressive scheduling class on the device,
++# competing with dex2oat on two 1 GHz cores, on a handset whose charger is
++# already backing off because VBUS sags.  It has nothing to do after the first
++# successful run: its entire body is "wait for the keymaster HAL, then exit".
+ service wait_for_keymaster /system/bin/wait_for_keymaster
+     user root
+     group root system
++    oneshot
+     priority -20
+     ioprio rt 0

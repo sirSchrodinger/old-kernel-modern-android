@@ -1,0 +1,142 @@
+diff --git a/camera/CameraParameters.cpp b/camera/CameraParameters.cpp
+index de8ac2f..55c4d44 100644
+--- a/camera/CameraParameters.cpp
++++ b/camera/CameraParameters.cpp
+@@ -20,6 +20,7 @@
+ 
+ #include <string.h>
+ #include <stdlib.h>
++#include <sys/time.h>
+ #include <camera/CameraParameters.h>
+ #include <system/graphics.h>
+ 
+@@ -537,4 +538,10 @@ bool CameraParameters::isEmpty() const {
+     return mMap.isEmpty();
+ }
+ 
++#ifdef CAMERA_PARAMETERS_HAVE_EXTRA
++// Definitions for the vendor-only members declared above, plus DurationTimer,
++// which libutils dropped after Oreo and the camera blob still calls.
++CAMERA_PARAMETERS_EXTRA_C
++#endif
++
+ }; // namespace android
+diff --git a/camera/include/camera/CameraParameters.h b/camera/include/camera/CameraParameters.h
+index ba33ffe..3ed59c1 100644
+--- a/camera/include/camera/CameraParameters.h
++++ b/camera/include/camera/CameraParameters.h
+@@ -20,6 +20,26 @@
+ #include <utils/KeyedVector.h>
+ #include <utils/String8.h>
+ 
++/*
++ * Vendor-only CameraParameters members.
++ *
++ * camera.vendor.montblanc.so links against members AOSP never had
++ * (SCENE_MODE_TEXT, SCENE_MODE_DUSKDAWN, KEY_RECORD_STRIDE,
++ * PIXEL_FORMAT_YUV420MB and friends).  The device tree carries the
++ * CyanogenMod-era macro pair that declares and defines them; it is found
++ * through TARGET_SPECIFIC_HEADER_PATH, which Soong prepends to every compile.
++ *
++ * __has_include rather than a -D: BoardConfig's TARGET_GLOBAL_CFLAGS does not
++ * reach Soong modules, and libcamera_client is one.  A tree without the header
++ * simply compiles as stock.
++ */
++#if defined(__has_include)
++#  if __has_include("camera/CameraParametersExtra.h")
++#    include "camera/CameraParametersExtra.h"
++#    define CAMERA_PARAMETERS_HAVE_EXTRA 1
++#  endif
++#endif
++
+ namespace android {
+ 
+ struct Size {
+@@ -690,6 +710,10 @@ public:
+      */
+     static int previewFormatToEnum(const char* format);
+ 
++#ifdef CAMERA_PARAMETERS_HAVE_EXTRA
++    CAMERA_PARAMETERS_EXTRA_H
++#endif
++
+ private:
+     DefaultKeyedVector<String8,String8>    mMap;
+ };
+diff --git a/media/codec2/vndk/C2AllocatorIon.cpp b/media/codec2/vndk/C2AllocatorIon.cpp
+index f7b78e3..2a1348c 100644
+--- a/media/codec2/vndk/C2AllocatorIon.cpp
++++ b/media/codec2/vndk/C2AllocatorIon.cpp
+@@ -531,6 +531,24 @@ std::shared_ptr<const C2Allocator::Traits> C2AllocatorIon::getTraits() const {
+ 
+ void C2AllocatorIon::setUsageMapper(
+         const UsageMapperFn &mapper, uint64_t minUsage, uint64_t maxUsage, uint64_t blockSize) {
++    // Ctor ion_open() basarisiz olursa mInit'i C2_OMITTED yapip mTraits'i HIC
++    // kurmuyor (bkz. C2AllocatorIon::C2AllocatorIon).  Asagidaki mTraits->name
++    // o durumda 0x0'dan std::string kopyalamaya calisiyor ve cagiran sureci
++    // olduruyor.
++    //
++    // golden'da olculdu (25 Agustos, tombstone_36): cekirdekte CONFIG_ION yok,
++    // yani ion_open() her zaman basarisiz.  Cokme system_server icinde oldu:
++    //   basic_string(const basic_string&) @0x0
++    //   <- C2AllocatorIon::setUsageMapper+202
++    //   <- UseComponentStoreForIonAllocator <- fetchIonAllocator
++    //   <- CCodecBufferChannel::start <- CCodec::start
++    // system_server, systemui ve media.codec ust uste bu yuzden cokuyordu.
++    //
++    // ION yoksa bu allocator kullanilamaz; sessizce geri don, cagiran zaten
++    // status() ile durumu ogrenebiliyor.
++    if (mInit != C2_OK || !mTraits) {
++        return;
++    }
+     std::lock_guard<std::mutex> lock(mUsageMapperLock);
+     mUsageMapperCache.clear();
+     mUsageMapperLru.clear();
+diff --git a/media/codec2/vndk/C2Store.cpp b/media/codec2/vndk/C2Store.cpp
+index 5b2bd7b..0ac824f 100644
+--- a/media/codec2/vndk/C2Store.cpp
++++ b/media/codec2/vndk/C2Store.cpp
+@@ -132,6 +132,14 @@ std::weak_ptr<C2AllocatorIon> gIonAllocator;
+ void UseComponentStoreForIonAllocator(
+         const std::shared_ptr<C2AllocatorIon> allocator,
+         std::shared_ptr<C2ComponentStore> store) {
++    // Kullanilamayan bir allocator ya da olmayan bir component store ile
++    // devam etmenin anlami yok: ilki setUsageMapper icinde null mTraits'e,
++    // ikincisi asagidaki store->querySupportedValues_sm() cagrisinda null
++    // shared_ptr uzerinden sanal cagriya (vptr'i 0x0'dan okumaya) goturuyor.
++    // Bu cihazda cekirdekte ION yok, yani ilk sart her zaman gerceklesiyor.
++    if (allocator == nullptr || allocator->status() != C2_OK || store == nullptr) {
++        return;
++    }
+     C2AllocatorIon::UsageMapperFn mapper;
+     uint64_t minUsage = 0;
+     uint64_t maxUsage = C2MemoryUsage(C2MemoryUsage::CPU_READ, C2MemoryUsage::CPU_WRITE).expected;
+diff --git a/services/audiopolicy/engine/common/src/EngineBase.cpp b/services/audiopolicy/engine/common/src/EngineBase.cpp
+index 07a7e65..a09e724 100644
+--- a/services/audiopolicy/engine/common/src/EngineBase.cpp
++++ b/services/audiopolicy/engine/common/src/EngineBase.cpp
+@@ -103,8 +103,22 @@ engineConfig::ParsingResult EngineBase::loadAudioPolicyEngineConfig()
+                 const auto &iter = std::find_if(begin(volumeGroups), end(volumeGroups),
+                                          [&group](const auto &volumeGroup) {
+                         return group.volumeGroup == volumeGroup.second->getName(); });
+-                ALOG_ASSERT(iter != end(volumeGroups), "Invalid Volume Group Name %s",
+-                            group.volumeGroup.c_str());
++                // ALOG_ASSERT compiles to nothing once LOG_NDEBUG is set, which
++                // it is in every user/userdebug build, so the dereference below
++                // ran on end(volumeGroups) and audioserver took SIGSEGV in
++                // VolumeGroup::addSupportedStream+16.  That is exactly what
++                // happens when parseLegacyVolumes() finds no
++                // audio_policy_configuration.xml under /odm/etc, /vendor/etc or
++                // /system/etc: it returns BAD_VALUE, volumeGroups stays empty,
++                // and every strategy in gDefaultEngineConfig then looks up a
++                // name that cannot be there.  A device shipping only the legacy
++                // audio_policy.conf must lose volume curves, not the whole
++                // audio server.
++                if (iter == end(volumeGroups)) {
++                    ALOGE("%s: no volume group named '%s' for strategy '%s', skipped",
++                          __FUNCTION__, group.volumeGroup.c_str(), strategyConfig.name.c_str());
++                    continue;
++                }
+                 if (group.stream != AUDIO_STREAM_DEFAULT) {
+                     iter->second->addSupportedStream(group.stream);
+                 }

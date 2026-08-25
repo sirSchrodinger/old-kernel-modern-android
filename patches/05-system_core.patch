@@ -1,0 +1,307 @@
+diff --git a/healthd/healthd_mode_charger.cpp b/healthd/healthd_mode_charger.cpp
+index 0e5aa4f..de12915 100644
+--- a/healthd/healthd_mode_charger.cpp
++++ b/healthd/healthd_mode_charger.cpp
+@@ -460,10 +460,45 @@ static void set_next_key_check(charger* charger, key_state* key, int64_t timeout
+ static void process_key(charger* charger, int code, int64_t now) {
+     key_state* key = &charger->keys[code];
+ 
+-    if (code == KEY_POWER) {
++    // golden: bu telefonun guc tusu fiziksel olarak sokuldu.  Sarj kipinden
++    // cikmanin tek yolu KEY_POWER'i iki saniye basili tutmakti; o tus yoksa
++    // telefon kapaliyken sarja takildiginda sonsuza kadar burada kaliyor ve
++    // bir daha acilamiyor.  Home tusu ayni isi gorsun.
++    if (code == KEY_POWER || code == KEY_HOME) {
+         if (key->down) {
+             int64_t reboot_timeout = key->timestamp + POWER_ON_KEY_TIME;
+             if (now >= reboot_timeout) {
++                // golden: RECOVERY'YE GIDEN GUC-TUSUSUZ YOL.
++                //
++                // Guc tusu sokuldugu icin hem "Ses Yukari + Home + Guc"
++                // (recovery) hem "Ses Asagi + Home + Guc" (download) kombinasyonu
++                // kullanilamiyor.  Geriye recovery'ye giden tek yol
++                // sirsch-recovery.sh kaliyordu - o da CALISAN bir sistem
++                // istiyor, yani ROM acilmazsa telefon kurtarilamaz hale
++                // geliyordu.
++                //
++                // Sarj kipi bu bosluğu kapatabilecek tek yer: telefon KAPALIYKEN
++                // ve sarja takiliyken root olarak calisiyor.  Ses Yukari basili
++                // tutulurken Home'a basilirsa normal boot yerine recovery'ye
++                // gidiliyor - eski kombinasyonun guc tususuz hali.
++                if (charger->keys[KEY_VOLUMEUP].down) {
++                    LOGW("[%" PRId64 "] Volume-Up + Home: recovery'ye geciliyor\n", now);
++                    if (access("/system/bin/sirsch-recovery.sh", X_OK) == 0) {
++                        pid_t pid = fork();
++                        if (pid == 0) {
++                            execl("/system/bin/sh", "sh",
++                                  "/system/bin/sirsch-recovery.sh", (char*)nullptr);
++                            _exit(127);
++                        }
++                        // Betik dd'yi bitirip kendi yeniden baslatiyor; burada
++                        // bekle ki normal boot yoluna dusulmesin.
++                        if (pid > 0) {
++                            sleep(30);
++                        }
++                    } else {
++                        LOGW("[%" PRId64 "] sirsch-recovery.sh yok, normal boot\n", now);
++                    }
++                }
+                 /* We do not currently support booting from charger mode on
+                    all devices. Check the property and continue booting or reboot
+                    accordingly. */
+@@ -507,6 +542,8 @@ static void process_key(charger* charger, int code, int64_t now) {
+ 
+ static void handle_input_state(charger* charger, int64_t now) {
+     process_key(charger, KEY_POWER, now);
++    // Home da guc tusu gibi islensin - yukaridaki aciklamaya bak.
++    process_key(charger, KEY_HOME, now);
+ 
+     if (charger->next_key_check != -1 && now > charger->next_key_check)
+         charger->next_key_check = -1;
+diff --git a/init/builtins.cpp b/init/builtins.cpp
+index 7db851a..4f8ad69 100644
+--- a/init/builtins.cpp
++++ b/init/builtins.cpp
+@@ -284,6 +284,25 @@ static Result<Success> do_insmod(const BuiltinArguments& args) {
+     if (fd == -1) return ErrnoError() << "open(\"" << filename << "\") failed";
+ 
+     int rc = syscall(__NR_finit_module, fd.get(), options.c_str(), flags);
++    if (rc == -1 && errno == ENOSYS) {
++        // finit_module() arrived in kernel 3.8.  This device runs 3.4, so every
++        // insmod in the init scripts failed with ENOSYS and no module was ever
++        // loaded - which took Wi-Fi with it, since dhd.ko is what creates wlan0.
++        // init_module() has been there since forever and takes the image in
++        // memory instead of by descriptor, so read the file and use that.
++        // MODULE_INIT_IGNORE_* have no equivalent here; nothing in this tree's
++        // init scripts passes -f, so nothing is lost.
++        std::string module_image;
++        if (!android::base::ReadFdToString(fd, &module_image)) {
++            return ErrnoError() << "couldn't read \"" << filename << "\"";
++        }
++        rc = syscall(__NR_init_module, module_image.data(), module_image.size(),
++                     options.c_str());
++        if (rc == -1) {
++            return ErrnoError() << "init_module for \"" << filename << "\" failed";
++        }
++        return Success();
++    }
+     if (rc == -1) return ErrnoError() << "finit_module for \"" << filename << "\" failed";
+ 
+     return Success();
+diff --git a/init/first_stage_mount.cpp b/init/first_stage_mount.cpp
+index 3e76556..0913d9a 100644
+--- a/init/first_stage_mount.cpp
++++ b/init/first_stage_mount.cpp
+@@ -383,14 +383,27 @@ ListenerAction FirstStageMount::HandleBlockDevice(const std::string& name, const
+     // Matches partition name to create device nodes.
+     // Both required_devices_partition_names_ and uevent->partition_name have A/B
+     // suffix when A/B is used.
++    bool isFound = false;
+     auto iter = required_devices_partition_names_.find(name);
+-    if (iter != required_devices_partition_names_.end()) {
+-        LOG(VERBOSE) << __PRETTY_FUNCTION__ << ": found partition: " << *iter;
++
++    if (iter != required_devices_partition_names_.end() ||
++        (uevent.path.find_last_of('/') != std::string::npos &&
++             required_devices_partition_names_.find(uevent.path.substr(uevent.path.find_last_of('/') + 1)) != required_devices_partition_names_.end())) {
++                 isFound = true;
++    }
++
++    if (isFound) {
++        LOG(ERROR) << __PRETTY_FUNCTION__ << ": found partition: " << name;
+         if (IsDmLinearEnabled() && name == super_partition_name_) {
+             std::vector<std::string> links = device_handler_->GetBlockDeviceSymlinks(uevent);
+             lp_metadata_partition_ = links[0];
+         }
+-        required_devices_partition_names_.erase(iter);
++        if (iter != required_devices_partition_names_.end()) {
++            required_devices_partition_names_.erase(iter);
++        } else {
++            auto path_iter = required_devices_partition_names_.find(uevent.path.substr(uevent.path.find_last_of('/') + 1));
++            required_devices_partition_names_.erase(path_iter);
++        }
+         device_handler_->HandleUevent(uevent);
+         if (required_devices_partition_names_.empty()) {
+             return ListenerAction::kStop;
+diff --git a/libcutils/Android.bp b/libcutils/Android.bp
+index 619bc56..bdc891c 100644
+--- a/libcutils/Android.bp
++++ b/libcutils/Android.bp
+@@ -58,6 +58,10 @@ cc_library {
+     recovery_available: true,
+     host_supported: true,
+     srcs: [
++        // Re-exports the android_atomic_* family that libcutils dropped after
++        // Oreo; the 2013 gralloc and camera blobs on this device still import
++        // it and fail to dlopen without it.  See atomic_legacy.c.
++        "atomic_legacy.c",
+         "config_utils.cpp",
+         "canned_fs_config.cpp",
+         "iosched_policy.cpp",
+diff --git a/libcutils/atomic_legacy.c b/libcutils/atomic_legacy.c
+new file mode 100644
+index 0000000..a32af81
+--- /dev/null
++++ b/libcutils/atomic_legacy.c
+@@ -0,0 +1,100 @@
++/*
++ * Out-of-line android_atomic_* for pre-Oreo vendor blobs.
++ *
++ * These were real exported symbols of libcutils until Android 8; today
++ * <cutils/atomic.h> only has ANDROID_ATOMIC_INLINE definitions, so nothing
++ * exports them any more.  Every blob on this device is from 2013 and two of
++ * them still import the symbols:
++ *
++ *   gralloc.montblanc.so         android_atomic_or
++ *                                android_atomic_release_cas
++ *                                android_atomic_release_store
++ *   camera.vendor.montblanc.so   android_atomic_inc
++ *                                android_atomic_dec
++ *
++ * Without them the dlopen fails:
++ *   E HAL: load: module=/system/lib/hw/gralloc.montblanc.so
++ *   E HAL: dlopen failed: cannot locate symbol "android_atomic_release_cas"
++ * and that one failure takes down the whole framework: no gralloc means no
++ * graphics composer, so SurfaceFlinger aborts with "failed to get hwcomposer
++ * service", and zygote dies with it.
++ *
++ * bionic's linker does carry TARGET_LD_SHIM_LIBS support, but it is behind a
++ * compile-time LD_SHIM_LIBS define that this build system never sets, so a
++ * shim library would need build-system plumbing as well.  Both blobs already
++ * link libcutils, so putting the symbols back where they used to live is the
++ * smaller and more predictable change.
++ *
++ * The whole family is defined, not only the five that are imported today:
++ * finding the next missing one costs a full flash-and-boot round on this
++ * handset, and the extra definitions cost nothing.
++ *
++ * Semantics are copied from <cutils/atomic.h> exactly - in particular the CAS
++ * functions return 0 on SUCCESS, which is the opposite of what the name
++ * suggests and is what the callers expect.
++ */
++
++#include <stdatomic.h>
++#include <stdint.h>
++
++static inline volatile atomic_int_least32_t* to_a32(volatile int32_t* addr) {
++    return (volatile atomic_int_least32_t*)addr;
++}
++
++static inline volatile const atomic_int_least32_t* to_ca32(volatile const int32_t* addr) {
++    return (volatile const atomic_int_least32_t*)addr;
++}
++
++int32_t android_atomic_inc(volatile int32_t* addr) {
++    return atomic_fetch_add_explicit(to_a32(addr), 1, memory_order_release);
++}
++
++int32_t android_atomic_dec(volatile int32_t* addr) {
++    return atomic_fetch_sub_explicit(to_a32(addr), 1, memory_order_release);
++}
++
++int32_t android_atomic_add(int32_t value, volatile int32_t* addr) {
++    return atomic_fetch_add_explicit(to_a32(addr), value, memory_order_release);
++}
++
++int32_t android_atomic_and(int32_t value, volatile int32_t* addr) {
++    return atomic_fetch_and_explicit(to_a32(addr), value, memory_order_release);
++}
++
++int32_t android_atomic_or(int32_t value, volatile int32_t* addr) {
++    return atomic_fetch_or_explicit(to_a32(addr), value, memory_order_release);
++}
++
++int32_t android_atomic_acquire_load(volatile const int32_t* addr) {
++    return atomic_load_explicit(to_ca32(addr), memory_order_acquire);
++}
++
++int32_t android_atomic_release_load(volatile const int32_t* addr) {
++    atomic_thread_fence(memory_order_seq_cst);
++    return atomic_load_explicit(to_ca32(addr), memory_order_relaxed);
++}
++
++void android_atomic_acquire_store(int32_t value, volatile int32_t* addr) {
++    atomic_store_explicit(to_a32(addr), value, memory_order_relaxed);
++    atomic_thread_fence(memory_order_seq_cst);
++}
++
++void android_atomic_release_store(int32_t value, volatile int32_t* addr) {
++    atomic_store_explicit(to_a32(addr), value, memory_order_release);
++}
++
++/* Returns 0 on success - see the note above. */
++int android_atomic_acquire_cas(int32_t oldvalue, int32_t newvalue,
++                               volatile int32_t* addr) {
++    return !atomic_compare_exchange_strong_explicit(
++        to_a32(addr), &oldvalue, newvalue,
++        memory_order_acquire, memory_order_acquire);
++}
++
++/* Returns 0 on success - see the note above. */
++int android_atomic_release_cas(int32_t oldvalue, int32_t newvalue,
++                               volatile int32_t* addr) {
++    return !atomic_compare_exchange_strong_explicit(
++        to_a32(addr), &oldvalue, newvalue,
++        memory_order_release, memory_order_relaxed);
++}
+diff --git a/libutils/Android.bp b/libutils/Android.bp
+index 4f194c7..9e219a1 100644
+--- a/libutils/Android.bp
++++ b/libutils/Android.bp
+@@ -123,6 +123,8 @@ cc_library {
+     defaults: ["libutils_defaults"],
+ 
+     srcs: [
++        // Vtable padding slots that pre-Oreo blobs still import; see the file.
++        "legacy_abi_shim.cpp",
+         "FileMap.cpp",
+         "JenkinsHash.cpp",
+         "NativeHandle.cpp",
+diff --git a/libutils/legacy_abi_shim.cpp b/libutils/legacy_abi_shim.cpp
+new file mode 100644
+index 0000000..c408a7f
+--- /dev/null
++++ b/libutils/legacy_abi_shim.cpp
+@@ -0,0 +1,42 @@
++/*
++ * Vtable padding slots that libutils exported until Oreo.
++ *
++ * VectorImpl and SortedVectorImpl used to end with eight empty virtual
++ * methods reserved for future ABI growth.  They were deleted upstream, but
++ * every pre-Oreo blob that links libutils still imports them, and the dlopen
++ * fails outright when they cannot be resolved.  On this device that hits:
++ *
++ *   audio.primary.DB8520H.so   16 symbols
++ *   libaudiopolicy_sec.so      16 symbols
++ *   libwvm.so                  16 symbols
++ *
++ * and the audio one is why audioserver dies with a null-pointer SIGSEGV in
++ * AudioFlinger::AudioFlinger(): the HAL never loads, so mDevicesFactoryHal is
++ * null.  Everything else those blobs import from VectorImpl (add, clear,
++ * removeItemsAt, the constructors) still exists; only the reserved slots are
++ * gone.
++ *
++ * Defined by mangled name rather than by re-adding the methods to the class:
++ * adding virtuals back would change the vtable of the libutils that the rest
++ * of the platform is compiled against, which is a much bigger change than the
++ * problem justifies.  The bodies are empty, which is exactly what they were.
++ */
++
++#define RESERVED(sym) extern "C" void sym(void) {}
++
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl1Ev)
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl2Ev)
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl3Ev)
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl4Ev)
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl5Ev)
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl6Ev)
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl7Ev)
++RESERVED(_ZN7android10VectorImpl19reservedVectorImpl8Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl1Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl2Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl3Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl4Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl5Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl6Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl7Ev)
++RESERVED(_ZN7android16SortedVectorImpl25reservedSortedVectorImpl8Ev)

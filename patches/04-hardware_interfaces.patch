@@ -1,0 +1,286 @@
+diff --git a/memtrack/1.0/default/Memtrack.cpp b/memtrack/1.0/default/Memtrack.cpp
+index 33a6906..f02de4d 100644
+--- a/memtrack/1.0/default/Memtrack.cpp
++++ b/memtrack/1.0/default/Memtrack.cpp
+@@ -29,13 +29,27 @@ namespace memtrack {
+ namespace V1_0 {
+ namespace implementation {
+ 
+-Memtrack::Memtrack(const memtrack_module_t *module) : mModule(module) {
++Memtrack::Memtrack(const memtrack_module_t *module, bool opened)
++        : mModule(module), mOpened(opened) {
+     if (mModule)
+         mModule->init(mModule);
+ }
+ 
++// Same bug as android.hardware.power@1.0-impl, same fix.  hw_get_module()
++// allocates nothing: for a HAL without methods->open it returns
++// HAL_MODULE_INFO_SYM in the dlopen'd library's .data, so delete(mModule)
++// hands je_free() a pointer that never came from the heap and the process
++// takes SIGSEGV.  In passthrough mode that process is whoever released the
++// last strong reference - here system_server, which talks to memtrack from
++// Debug.getMemoryInfo().  The opened branch is not deletable either: it yields
++// a hw_device_t, released with common.close(), not operator delete.
+ Memtrack::~Memtrack() {
+-    delete(mModule);
++    if (!mOpened || !mModule)
++        return;
++    hw_device_t *dev = reinterpret_cast<hw_device_t *>(
++            const_cast<memtrack_module_t *>(mModule));
++    if (dev->close)
++        dev->close(dev);
+ }
+ 
+ Return<void> Memtrack::getMemory(int32_t pid, MemtrackType type,
+@@ -82,6 +96,7 @@ IMemtrack* HIDL_FETCH_IMemtrack(const char* /* name */) {
+         return nullptr;
+     }
+ 
++    bool opened = false;
+     if (!hw_module->methods || !hw_module->methods->open) {
+         memtrack_module = reinterpret_cast<const memtrack_module_t*>(hw_module);
+     } else {
+@@ -91,8 +106,9 @@ IMemtrack* HIDL_FETCH_IMemtrack(const char* /* name */) {
+             ALOGE("Passthrough failed to load legacy HAL.");
+             return nullptr;
+         }
++        opened = true;
+     }
+-    return new Memtrack(memtrack_module);
++    return new Memtrack(memtrack_module, opened);
+ }
+ 
+ } // namespace implementation
+diff --git a/memtrack/1.0/default/Memtrack.h b/memtrack/1.0/default/Memtrack.h
+index 0adba76..ede209a 100644
+--- a/memtrack/1.0/default/Memtrack.h
++++ b/memtrack/1.0/default/Memtrack.h
+@@ -38,12 +38,14 @@ using ::android::hardware::hidl_string;
+ using ::android::sp;
+ 
+ struct Memtrack : public IMemtrack {
+-    Memtrack(const memtrack_module_t* module);
++    Memtrack(const memtrack_module_t* module, bool opened);
+     ~Memtrack();
+     Return<void> getMemory(int32_t pid, MemtrackType type, getMemory_cb _hidl_cb)  override;
+ 
+   private:
+     const memtrack_module_t* mModule;
++    // true only when methods->open() produced a hw_device_t we own.
++    bool mOpened;
+ };
+ 
+ extern "C" IMemtrack* HIDL_FETCH_IMemtrack(const char* name);
+diff --git a/power/1.0/default/Power.cpp b/power/1.0/default/Power.cpp
+index 51f87f5..0b75eb6 100644
+--- a/power/1.0/default/Power.cpp
++++ b/power/1.0/default/Power.cpp
+@@ -29,13 +29,35 @@ namespace power {
+ namespace V1_0 {
+ namespace implementation {
+ 
+-Power::Power(power_module_t *module) : mModule(module) {
++Power::Power(power_module_t *module, bool opened)
++        : mModule(module), mOpened(opened) {
+     if (mModule)
+         mModule->init(mModule);
+ }
+ 
++// hw_get_module() does not allocate anything.  For a HAL without
++// methods->open it returns HAL_MODULE_INFO_SYM itself, which lives in the
++// dlopen'd library's .data section, so `delete(mModule)` reaches je_free()
++// with a pointer that never came from the heap.  That is not a leak fixed
++// late, it is a segfault - and in passthrough mode it happens inside whoever
++// dropped the last strong reference.  Here that is system_server:
++// setUpPowerStatsLocked() calls IPower::getService(), lets the temporary sp<>
++// die at the end of the `if`, and the whole process dies with it.
++//
++// Measured on golden, 25 August: tombstone_27, tid batterystats-wo,
++//   je_free+924 <- ~Power <- RefBase::decStrong <- setUpPowerStatsLocked
++//   <- getRailEnergyPowerStats <- BatteryStatsService.fillRailDataStats
++// system_server was killed on every BatteryStats rail-stats update, so
++// sys.boot_completed was never reached and the boot animation ran forever.
++//
++// The other branch is not deletable either: methods->open() hands back a
++// hw_device_t whose contract is common.close(), not operator delete.
+ Power::~Power() {
+-    delete(mModule);
++    if (!mOpened || !mModule)
++        return;
++    hw_device_t *dev = reinterpret_cast<hw_device_t *>(mModule);
++    if (dev->close)
++        dev->close(dev);
+ }
+ 
+ // Methods from ::android::hardware::power::V1_0::IPower follow.
+@@ -153,6 +175,7 @@ IPower* HIDL_FETCH_IPower(const char* /* name */) {
+         return nullptr;
+     }
+ 
++    bool opened = false;
+     if (!hw_module->methods || !hw_module->methods->open) {
+         power_module = reinterpret_cast<power_module_t*>(
+             const_cast<hw_module_t*>(hw_module));
+@@ -164,8 +187,9 @@ IPower* HIDL_FETCH_IPower(const char* /* name */) {
+             ALOGE("Passthrough failed to load legacy HAL.");
+             return nullptr;
+         }
++        opened = true;
+     }
+-    return new Power(power_module);
++    return new Power(power_module, opened);
+ }
+ 
+ } // namespace implementation
+diff --git a/power/1.0/default/Power.h b/power/1.0/default/Power.h
+index a43aefb..989558b 100644
+--- a/power/1.0/default/Power.h
++++ b/power/1.0/default/Power.h
+@@ -39,7 +39,7 @@ using ::android::hardware::hidl_string;
+ using ::android::sp;
+ 
+ struct Power : public IPower {
+-    Power(power_module_t* module);
++    Power(power_module_t* module, bool opened);
+     ~Power();
+     Return<void> setInteractive(bool interactive)  override;
+     Return<void> powerHint(PowerHint hint, int32_t data)  override;
+@@ -48,6 +48,9 @@ struct Power : public IPower {
+ 
+   private:
+     power_module_t* mModule;
++    // true only when methods->open() produced a hw_device_t we own;
++    // a bare HAL_MODULE_INFO_SYM must never be released.
++    bool mOpened;
+ };
+ 
+ extern "C" IPower* HIDL_FETCH_IPower(const char* name);
+diff --git a/sensors/1.0/default/Sensors.cpp b/sensors/1.0/default/Sensors.cpp
+index 1100dd6..b05cedf 100644
+--- a/sensors/1.0/default/Sensors.cpp
++++ b/sensors/1.0/default/Sensors.cpp
+@@ -93,11 +93,26 @@ Sensors::Sensors()
+         return;
+     }
+ 
+-    // Require all the old HAL APIs to be present except for injection, which
+-    // is considered optional.
+-    CHECK_GE(getHalDeviceVersion(), SENSORS_DEVICE_API_VERSION_1_3);
++    // Upstream burada CHECK_GE(getHalDeviceVersion(), SENSORS_DEVICE_API_VERSION_1_3)
++    // yapip surecin olmesine izin veriyor.  golden'da Samsung'un 2013 tarihli
++    // sensors.montblanc.so'su common.version = 0 bildiriyor (1.0 oncesi HAL) ve
++    // bu CHECK dogrudan system_server'i olduruyordu:
++    //   Check failed: getHalDeviceVersion() >= ... (getHalDeviceVersion()=0)
++    //   Sensors::Sensors()+634 <- HIDL_FETCH_ISensors <- PassthroughServiceManager
++    //
++    // Eski HAL'de sensors_poll_device_1_t'nin sadece v0 kismi ayrilmis oluyor:
++    // activate/setDelay/poll var, batch/flush/inject_sensor_data/
++    // register_direct_channel/config_direct_report YOK - o alanlari okumak bile
++    // ayrilmis bellegin disina tasar.  O yuzden surum bir kez olculup
++    // saklaniyor ve 1.1 oncesinde o alanlara hic dokunulmuyor.
++    mEskiHal = getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_1;
++    if (mEskiHal) {
++        LOG(WARNING) << "sensors HAL surumu " << getHalDeviceVersion()
++                     << " (1.1 oncesi): batch/flush/injection/direct report yok, "
++                        "sampling periyodu setDelay ile ayarlanacak";
++    }
+ 
+-    if (getHalDeviceVersion() == SENSORS_DEVICE_API_VERSION_1_4) {
++    if (!mEskiHal && getHalDeviceVersion() == SENSORS_DEVICE_API_VERSION_1_4) {
+         if (mSensorDevice->inject_sensor_data == nullptr) {
+             LOG(ERROR) << "HAL specifies version 1.4, but does not implement inject_sensor_data()";
+         }
+@@ -141,7 +156,8 @@ int Sensors::getHalDeviceVersion() const {
+ }
+ 
+ Return<Result> Sensors::setOperationMode(OperationMode mode) {
+-    if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4
++    if (mEskiHal
++            || getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4
+             || mSensorModule->set_operation_mode == nullptr) {
+         return Result::INVALID_OPERATION;
+     }
+@@ -235,6 +251,18 @@ Return<Result> Sensors::batch(
+         int32_t sensor_handle,
+         int64_t sampling_period_ns,
+         int64_t max_report_latency_ns) {
++    if (mEskiHal) {
++        // 1.1 oncesi HAL'de batching yok.  Kuyruklama olmadan yalnizca ornekleme
++        // periyodu ayarlanabilir; max_report_latency_ns kacinilmaz olarak 0 gibi
++        // davranir, yani olaylar geldigi anda teslim edilir.  Framework bunu
++        // zaten destekliyor - batching sensorun fifo derinligi 0 oldugunda normal
++        // durum.
++        return ResultFromStatus(
++                mSensorDevice->setDelay(
++                    reinterpret_cast<sensors_poll_device_t *>(mSensorDevice),
++                    sensor_handle,
++                    sampling_period_ns));
++    }
+     return ResultFromStatus(
+             mSensorDevice->batch(
+                 mSensorDevice,
+@@ -245,11 +273,18 @@ Return<Result> Sensors::batch(
+ }
+ 
+ Return<Result> Sensors::flush(int32_t sensor_handle) {
++    if (mEskiHal) {
++        // flush() yoksa dogru cevap BAD_VALUE: SensorService bunu "bu sensor
++        // flush desteklemiyor" diye yorumluyor ve META_DATA_FLUSH_COMPLETE
++        // beklemekten vazgeciyor.
++        return Result::BAD_VALUE;
++    }
+     return ResultFromStatus(mSensorDevice->flush(mSensorDevice, sensor_handle));
+ }
+ 
+ Return<Result> Sensors::injectSensorData(const Event& event) {
+-    if (getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4
++    if (mEskiHal
++            || getHalDeviceVersion() < SENSORS_DEVICE_API_VERSION_1_4
+             || mSensorDevice->inject_sensor_data == nullptr) {
+         return Result::INVALID_OPERATION;
+     }
+@@ -263,7 +298,8 @@ Return<Result> Sensors::injectSensorData(const Event& event) {
+ 
+ Return<void> Sensors::registerDirectChannel(
+         const SharedMemInfo& mem, registerDirectChannel_cb _hidl_cb) {
+-    if (mSensorDevice->register_direct_channel == nullptr
++    if (mEskiHal
++            || mSensorDevice->register_direct_channel == nullptr
+             || mSensorDevice->config_direct_report == nullptr) {
+         // HAL does not support
+         _hidl_cb(Result::INVALID_OPERATION, -1);
+@@ -288,7 +324,8 @@ Return<void> Sensors::registerDirectChannel(
+ }
+ 
+ Return<Result> Sensors::unregisterDirectChannel(int32_t channelHandle) {
+-    if (mSensorDevice->register_direct_channel == nullptr
++    if (mEskiHal
++            || mSensorDevice->register_direct_channel == nullptr
+             || mSensorDevice->config_direct_report == nullptr) {
+         // HAL does not support
+         return Result::INVALID_OPERATION;
+@@ -302,7 +339,8 @@ Return<Result> Sensors::unregisterDirectChannel(int32_t channelHandle) {
+ Return<void> Sensors::configDirectReport(
+         int32_t sensorHandle, int32_t channelHandle, RateLevel rate,
+         configDirectReport_cb _hidl_cb) {
+-    if (mSensorDevice->register_direct_channel == nullptr
++    if (mEskiHal
++            || mSensorDevice->register_direct_channel == nullptr
+             || mSensorDevice->config_direct_report == nullptr) {
+         // HAL does not support
+         _hidl_cb(Result::INVALID_OPERATION, -1);
+diff --git a/sensors/1.0/default/Sensors.h b/sensors/1.0/default/Sensors.h
+index be00a96..bc6b0ce 100644
+--- a/sensors/1.0/default/Sensors.h
++++ b/sensors/1.0/default/Sensors.h
+@@ -67,6 +67,10 @@ private:
+     status_t mInitCheck;
+     sensors_module_t *mSensorModule;
+     sensors_poll_device_1_t *mSensorDevice;
++    // 1.1 oncesi HAL: sensors_poll_device_1_t'nin yalnizca v0 kismi
++    // gercekten ayrilmis; batch/flush/injection/direct-report alanlarina
++    // dokunmak ayrilmis bellegin disina tasar.
++    bool mEskiHal = false;
+     std::mutex mPollLock;
+ 
+     int getHalDeviceVersion() const;

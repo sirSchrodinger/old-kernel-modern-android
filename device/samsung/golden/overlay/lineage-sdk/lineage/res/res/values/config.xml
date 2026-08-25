@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     Key behaviour for a handset with no power button.
+
+     The power button was physically removed from this device, so the only way
+     to blank the screen has to come from a key that still exists.  Home is the
+     one that does (gpio-keys, code 172, and gpio-keys.kl already marks it
+     WAKE_DROPPED so it wakes the device too).
+
+     PhoneWindowManager reads this default through
+     org.lineageos.platform.internal.R.integer.config_longPressOnHomeBehavior
+     (PhoneWindowManager.java:2336), NOT through the AOSP resource of the same
+     name - the AOSP one has a different, three-value meaning.  The value is a
+     DeviceKeysConstants.Action ordinal: 7 = SLEEP.
+
+     lineage-sdk's own default is 3 (SEARCH).
+-->
+<resources>
+    <integer name="config_longPressOnHomeBehavior">7</integer>
+</resources>

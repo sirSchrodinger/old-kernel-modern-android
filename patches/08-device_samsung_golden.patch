@@ -1,0 +1,1750 @@
+diff --git a/BoardConfig.mk b/BoardConfig.mk
+index 838ed91..0c31ae0 100755
+--- a/BoardConfig.mk
++++ b/BoardConfig.mk
+@@ -60,15 +60,23 @@ TARGET_PROVIDES_INIT := true
+ TARGET_PROVIDES_INIT_TARGET_RC := true
+ 
+ 
++# Bu liste linker'a -DSDK_VERSION_OVERRIDES olarak gomuluyor ve
++# bionic/linker/linker.cpp:4306 girdiyi YALNIZCA executable_path ile
++# karsilastiriyor:
++#     if (splitted.size() == 2 && splitted[0] == executable_path)
++# Yani .so yollari hicbir zaman eslesmez - buradaki alti satir no-op'tu.
++# Islevi olan yalnizca calistirilabilir dosyalar: rild ve glgps.  Kutuphane
++# bazinda override LineageOS'ta bir kez denenip terk edilmis.
++#
++# audioserver=22 eklendi: Samsung'un 2013 libsecril-client.so'su
++# Disconnect_RILD() icinde olmus bir thread'e pthread_join atiyor ve modern
++# bionic bunu async_safe_fatal ile olduruyor.  Surece ozel target SDK 22
++# vermek, __pthread_internal_find'i O oncesi davranisa (uyar + ESRCH)
++# dondurmenin HEDEFLI yolu - bionic'i global olarak zayiflatmaya gerek
++# kalmaz.  Etkin olmasi icin linker'in yeniden derlenmesi gerekiyor.
+ TARGET_PROCESS_SDK_VERSION_OVERRIDE := \
+     /vendor/bin/hw/rild=22 \
+-    /system/vendor/lib/libsec-ril.so=22 \
+-    /system/lib/libsecnativefeature.so=22 \
+-    /system/lib/libomission_avoidance.so=22 \
+-    /system/lib/libfactoryutil.so=22 \
+-    /system/vendor/lib/libakm.so=22 \
+-    /system/vendor/lib/libsecril-client.so=22 \
+-    /system/vendor/lib/hw/gps.exynos4.vendor.so=22 \
++    /system/bin/audioserver=22 \
+     /system/vendor/bin/glgps=22
+ 	
+ TARGET_FS_CONFIG_GEN := device/samsung/golden/config.fs
+@@ -76,6 +84,22 @@ TARGET_FS_CONFIG_GEN := device/samsung/golden/config.fs
+ # Network Routing
+ TARGET_NEEDS_NETD_DIRECT_CONNECT_RULE := true
+ 
++# Mount points must be baked in.  The earlier note here claimed fs_mgr's
++# __mount() would mkdir a missing mount point and that init.samsunggolden.rc
++# creates them in "on init"; both are wrong for this configuration and the
++# boot log proves it:
++#   __mount(source=/dev/block/mmcblk0p12,target=/modemfs(missing),type=ext4)=-1
++#   Command 'mkdir /modemfs ...' failed: mkdir() failed: Read-only file system
++# init switches root to /system, so "/" is the read-only system partition and
++# every "on init" mkdir at the root fails.  fs_mgr then counts the failed mount
++# as an error, fs_mgr_mount_all() returns FS_MGR_MNTALL_FAIL, do_mount_all()
++# never reaches queue_fs_event(), ro.crypto.state is never set, and so neither
++# "on nonencrypted" nor any "on zygote-start && property:ro.crypto.state=..."
++# block ever matches - class main is never started and the boot stops dead with
++# only class core running.
++# /modemfs already has a label (selinux/file_contexts).  /preload has none and
++# LineageOS has no use for Samsung's preload partition, so it is dropped from
++# the fstab instead of being labelled.
+ BOARD_ROOT_EXTRA_FOLDERS := \
+ 	uid_0 \
+ 	uid_1000 \
+@@ -91,7 +115,8 @@ BOARD_ROOT_EXTRA_FOLDERS := \
+ 	acct \
+ 	tmp \
+ 	debug \
+-	efs
++	efs \
++	modemfs
+ 
+ 
+ # Partitions
+@@ -121,14 +146,56 @@ TARGET_COPY_OUT_VENDOR := system/vendor
+ # Kernel
+ TARGET_KERNEL_CONFIG := golden_defconfig
+ TARGET_KERNEL_SOURCE := kernel/samsung/golden
+-BOARD_KERNEL_CMDLINE += enforcing=0 androidboot.selinux=permissive root=/dev/ram0 rw
++# androidboot.hardware is not optional here.  Android 10 dropped init's old
++# /proc/cpuinfo fallback for ro.hardware (the stock 4.1 ROM still had it), so the
++# kernel cmdline is the only source left, and this bootloader passes none of its
++# own.  With ro.hardware empty, two separate things fail: first-stage init cannot
++# resolve /fstab.<hardware> in GetFstabPath(), and second-stage init cannot
++# resolve "import /init.${ro.hardware}.rc" or the vendor one on the next line, so
++# mount_all never runs.  ueventd loses its device-node rules for the same reason.
++# androidboot.wificountrycode -> ro.boot.wificountrycode, which is what
++# WifiCountryCode reads as its default when no SIM has told it otherwise.
++# Without it the framework falls back to the world regulatory domain, where
++# 2.4 GHz channels 12 and 13 are never scanned - and Turkish routers sit on
++# them often enough that "wifi sees no networks" is the usual symptom.  The
++# kernel is built with CONFIG_CFG80211_REG_NOT_UPDATED=y, so nothing else is
++# going to correct this later.
++BOARD_KERNEL_CMDLINE += enforcing=0 androidboot.selinux=permissive root=/dev/ram0 rw androidboot.hardware=samsunggolden androidboot.wificountrycode=tr
++
++# Keep charging when the AB8500 raises USB_CHARGER_NOT_OK.  It measures VBUS at
++# 4616 mV on this connector - under its window - and the driver's stock
++# response is to stop the charge outright, so current_now stays negative and
++# the handset only ever discharges while plugged in.  The flag is still
++# recorded and logged; only the "stop" is skipped.  The cut-outs that protect
++# the cell - VBUS over-voltage, battery over-voltage, thermal protection and
++# the charge watchdog - are separate flags and are untouched.
++# Undo: delete this line, or `echo 0 > /sys/module/abb_charger/parameters/zayif_vbus`.
++BOARD_KERNEL_CMDLINE += abb_charger.zayif_vbus=1
++
++# Let the charger draw more than the 500 mA a PC port advertises.  While
++# Android boots this handset pulls more than that, so with the stock ceiling
++# the battery drains even with the cable in - measured -300 mA.  If the port
++# cannot hold it the AB8500's VBUS-drop handler steps the input back down by
++# itself, so this raises a ceiling rather than forcing a current.
++BOARD_KERNEL_CMDLINE += abb_charger.giris_akimi=900
+ BOARD_KERNEL_BASE := 0x00000000
+ BOARD_KERNEL_PAGESIZE := 2048
+ BOARD_KERNEL_IMAGE_NAME := zImage
++# mkbootimg defaults the ramdisk to 0x01000000.  The decompressed kernel is
++# 10.0 MiB at 0x8000 and the zImage relocates its compressed copy past that,
++# topping out near 15.2 MiB - under 1 MiB of clearance.  Stock and TWRP both load
++# the ramdisk at 0x02000000 on this device, so use the address the bootloader is
++# known to work with.  Note BOARD_RAMDISK_OFFSET is NOT the knob for this: in
++# this build system it only gets written into target_files and never reaches
++# mkbootimg.  BOARD_MKBOOTIMG_ARGS is appended to both boot and recovery.
++BOARD_MKBOOTIMG_ARGS += --ramdisk_offset 0x02000000
+ # Use GCC 4.7
+ KERNEL_TOOLCHAIN_PREFIX := arm-eabi-
+ TARGET_KERNEL_CUSTOM_TOOLCHAIN := arm-eabi-4.7
+-KERNEL_TOOLCHAIN := "/home/nni16/golden/prebuilts/gcc/linux-x86/arm/arm-eabi-4.7/bin"
++# Was hardcoded to the porter's own home directory, which of course only
++# existed on their machine.  BUILD_TOP is what vendor/lineage uses for exactly
++# this, so the path follows the tree wherever it is checked out.
++KERNEL_TOOLCHAIN := $(shell pwd)/prebuilts/gcc/linux-x86/arm/arm-eabi-4.7/bin
+ 
+ # Memory management
+ MALLOC_SVELTE := true
+@@ -176,7 +243,13 @@ BOARD_WPA_SUPPLICANT_DRIVER := NL80211
+ BOARD_WPA_SUPPLICANT_PRIVATE_LIB := lib_driver_cmd_bcmdhd
+ BOARD_HOSTAPD_DRIVER := NL80211
+ BOARD_HOSTAPD_PRIVATE_LIB := lib_driver_cmd_bcmdhd
+-WIFI_DRIVER_MODULE_PATH := "/system/vendor/lib/modules/dhd.ko"
++# Nothing reads WIFI_DRIVER_MODULE_PATH any more - Android 10 deleted
++# hardware/libhardware_legacy/wifi, which was the only consumer - but it was
++# also pointing at the wrong place: NEED_KERNEL_MODULE_SYSTEM puts modules in
++# $(TARGET_OUT)/lib/modules, i.e. /system/lib/modules.  Corrected so it does not
++# mislead the next reader.  The driver is actually loaded by an insmod in
++# init.samsunggolden.rc's "on post-fs".
++WIFI_DRIVER_MODULE_PATH := "/system/lib/modules/dhd.ko"
+ WIFI_DRIVER_FW_PATH_PARAM := "/sys/module/dhd/parameters/firmware_path"
+ WIFI_DRIVER_FW_PATH_STA := "/system/etc/wifi/bcmdhd_sta.bin"
+ WIFI_DRIVER_FW_PATH_AP := "/system/etc/wifi/bcmdhd_apsta.bin"
+@@ -291,4 +364,10 @@ DEXPREOPT_USE_APEX_IMAGE := false
+ TARGET_NEEDS_PLATFORM_TEXT_RELOCATIONS := true
+ 
+ 
+-TARGET_SYSTEM_PROP := device/samsung/golden/system.prop
+\ No newline at end of file
++TARGET_SYSTEM_PROP := device/samsung/golden/system.prop
++
++# vendor/lineage/bootanimation/Android.mk honours TARGET_BOOTANIMATION when it
++# is already set, so our zip replaces the generated Lineage logo without
++# touching that module.  TARGET_BOOTANIMATION_PRELOAD is already true above,
++# which is what makes a 131 KB zip play smoothly on a 1 GHz A9.
++TARGET_BOOTANIMATION := vendor/sirsch/prebuilt/bootanimation.zip
+diff --git a/golden.mk b/golden.mk
+index e37fd39..94c1137 100644
+--- a/golden.mk
++++ b/golden.mk
+@@ -23,7 +23,36 @@ $(call inherit-product, build/target/product/full_base_telephony.mk)
+ $(call inherit-product, build/target/product/languages_full.mk)
+ 
+ # Use the Dalvik VM specific for devices with 1024 MB of RAM
+-$(call inherit-product, frameworks/native/build/phone-xhdpi-1024-dalvik-heap.mk)
++# 512 profile, not 1024: the non-CC collector reserves two spaces of
++# dalvik.vm.heapsize each plus a 64 MB non-moving space, and at 256 MB that is
++# 576 MB of a 32-bit process's address space before anything else is mapped.
++# 128 MB is what let system_server start.  Inheriting the smaller profile
++# rather than overriding the property, because a later
++# PRODUCT_PROPERTY_OVERRIDES of the same key does not win - verified: the
++# override was in golden.mk and build.prop still came out with heapsize=256m.
++$(call inherit-product, frameworks/native/build/phone-hdpi-512-dalvik-heap.mk)
++
++# ART's concurrent copying collector is what makes zygote fail on this handset.
++# Measured on 24-25 August from /proc/<zygote>/maps:
++#   * [anon:dalvik-main space (region space)] reserves 2x the heap - 512 MB of
++#     address space for a 256 MB heap, at a fixed low address
++#   * 477 separate [anon:dalvik-thread local mark stack] mappings, 16 KB each,
++#     scattered across the 2 GB above TASK_UNMAPPED_BASE
++# Only 142 MB is actually mapped up there, but it is cut into 676 holes whose
++# largest is 21.7 MB, so the boot image cannot be placed:
++#   E zygote: Failed anonymous mmap(0x6f643000, 94806016, ...): Out of memory
++#   E ICU   : Couldn't mmap '.../icudt63l.dat': Out of memory
++# The two free regions big enough (468 MB and 236 MB) sit below
++# TASK_UNMAPPED_BASE (0x40000000 on ARM), which neither the top-down walk nor
++# its bottom-up fallback reaches.
++# Read barriers are a compile-time choice - kUseReadBarrier forces
++# kCollectorTypeCC - so this cannot be switched with a property.
++# Note: it is PRODUCT_ART_USE_READ_BARRIER that Soong reads
++# (build/make/core/soong_config.mk:105 -> ArtUseReadBarrier); the same name
++# without the PRODUCT_ prefix in BoardConfig.mk is silently ignored.
++PRODUCT_ART_USE_READ_BARRIER := false
++
++
+ 
+ # Inherit the proprietary vendors blobs.
+ $(call inherit-product, vendor/samsung/golden/golden-vendor.mk)
+@@ -38,9 +67,13 @@ PRODUCT_COPY_FILES += \
+     $(LOCAL_PATH)/rootdir/init.ste.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/hw/init.ste.rc
+ 
+ # Recovery ramdisk, libraries and modules.
++# recovery/root/etc used to be a real directory; in Android 10's ramdisk /etc is
++# a symlink to /system/etc, so copying files into it makes the recovery ramdisk
++# rule fail ("could not make way for new symlink: root/etc").  recovery.fstab is
++# already installed at root/system/etc by the standard rule, and twrp.fstab is
++# only wanted by a TWRP that this tree does not build - bootable/recovery-twrp
++# is not part of LineageOS 17.1.
+ PRODUCT_COPY_FILES += \
+-    $(LOCAL_PATH)/rootdir/fstab.samsunggolden:recovery/root/etc/recovery.fstab \
+-    $(LOCAL_PATH)/rootdir/fstab.samsunggolden:recovery/root/etc/twrp.fstab \
+     $(LOCAL_PATH)/recovery/rootdir/sbin/libkeyutils.so:recovery/root/sbin/libkeyutils.so \
+     $(LOCAL_PATH)/recovery/rootdir/sbin/libsec_km.so:recovery/root/sbin/libsec_km.so \
+     $(LOCAL_PATH)/recovery/rootdir/sbin/libsec_ecryptfs.so:recovery/root/sbin/libsec_ecryptfs.so 
+@@ -107,10 +140,19 @@ PRODUCT_PACKAGES += \
+     Snap
+ 
+ # Wifi
++# The supplicant looks for its config under /vendor/etc/wifi - those paths are
++# compile-time constants in external/wpa_supplicant_8 (hidl/1.2/supplicant.cpp:
++# kStaIfaceConfOverlayPath, kVendorTemplateConfPath).  It seeds
++# /data/vendor/wifi/wpa/wpa_supplicant.conf from the template on first run, so
++# the template has to actually be there.  The /system copies stay because the
++# same file also lists them as a migration source for older devices.
+ PRODUCT_COPY_FILES += \
+     $(LOCAL_PATH)/configs/etc/wifi/wpa_supplicant.conf:system/etc/wifi/wpa_supplicant.conf \
+     $(LOCAL_PATH)/configs/etc/wifi/wpa_supplicant_overlay.conf:system/etc/wifi/wpa_supplicant_overlay.conf \
+-    $(LOCAL_PATH)/configs/etc/wifi/p2p_supplicant_overlay.conf:system/etc/wifi/p2p_supplicant_overlay.conf
++    $(LOCAL_PATH)/configs/etc/wifi/p2p_supplicant_overlay.conf:system/etc/wifi/p2p_supplicant_overlay.conf \
++    $(LOCAL_PATH)/configs/etc/wifi/wpa_supplicant.conf:system/vendor/etc/wifi/wpa_supplicant.conf \
++    $(LOCAL_PATH)/configs/etc/wifi/wpa_supplicant_overlay.conf:system/vendor/etc/wifi/wpa_supplicant_overlay.conf \
++    $(LOCAL_PATH)/configs/etc/wifi/p2p_supplicant_overlay.conf:system/vendor/etc/wifi/p2p_supplicant_overlay.conf
+ 
+ PRODUCT_PACKAGES += \
+     dhcpcd.conf \
+@@ -120,6 +162,18 @@ PRODUCT_PACKAGES += \
+     wpa_supplicant \
+     wpa_supplicant.conf
+ 
++# NOT setting ro.adb.secure=0 here, deliberately.  It looks like the fix for the
++# on-screen adb confirmation dialog and it is not:
++#   * main.mk:280 only adds ro.adb.secure=1 for the "user" variant, and this
++#     tree builds userdebug - so the property is not being forced on in the
++#     first place, and turning it "off" fixes nothing.
++#   * vendor/sirsch already bakes this machine's public key into /adb_keys, so
++#     connections from here are accepted without a prompt anyway.
++#   * ro.adb.secure=0 would accept ANY host on the LAN as root, which is the
++#     one thing 02-derle.sh's WITH_ADB_INSECURE comment says not to do.
++# If a confirmation dialog really does appear, measure where the property comes
++# from on the device first - do not guess.
++
+ PRODUCT_PROPERTY_OVERRIDES += \
+     wifi.interface=wlan0 \
+     wifi.supplicant_scan_interval=150 \
+@@ -155,6 +209,12 @@ PRODUCT_COPY_FILES += \
+ # Audio
+ PRODUCT_COPY_FILES += \
+     $(LOCAL_PATH)/configs/etc/audio_policy.conf:system/etc/audio_policy.conf \
++    $(LOCAL_PATH)/configs/audio/audio_policy_configuration.xml:system/etc/audio_policy_configuration.xml \
++    frameworks/av/services/audiopolicy/config/a2dp_audio_policy_configuration.xml:system/etc/a2dp_audio_policy_configuration.xml \
++    frameworks/av/services/audiopolicy/config/usb_audio_policy_configuration.xml:system/etc/usb_audio_policy_configuration.xml \
++    frameworks/av/services/audiopolicy/config/r_submix_audio_policy_configuration.xml:system/etc/r_submix_audio_policy_configuration.xml \
++    frameworks/av/services/audiopolicy/config/audio_policy_volumes.xml:system/etc/audio_policy_volumes.xml \
++    frameworks/av/services/audiopolicy/config/default_volume_tables.xml:system/etc/default_volume_tables.xml \
+     $(LOCAL_PATH)/configs/etc/asound.conf:system/etc/asound.conf
+ 
+ PRODUCT_PACKAGES += \
+@@ -221,7 +281,9 @@ PRODUCT_PACKAGES += \
+ # Non-device-specific props
+ PRODUCT_PROPERTY_OVERRIDES += \
+     ro.com.google.locationfeatures=1 \
+-    ro.setupwizard.mode=OPTIONAL \
++    # ro.setupwizard.mode burada OPTIONAL, vendor/sirsch/config/sirsch.mk:102'de
++    # DISABLED idi - ayni anahtar iki yerde farkli.  Kurulum sihirbazi bu imajda
++    # zaten yok, o yuzden buradaki satir kaldirildi ve DISABLED birakildi.
+     ro.setupwizard.enable_bypass=1 \
+     ro.config.sync=yes \
+     ro.config.low_ram=true \
+@@ -241,10 +303,26 @@ DEVICE_MANIFEST_FILE := $(LOCAL_PATH)/manifest.xml
+ PRODUCT_PACKAGES += \
+ libbt-vendor
+ 
+-#
+-#PRODUCT_PACKAGES += \
+-#android.hardware.keymaster@3.0-service \
+-#android.hardware.keymaster@3.0-impl
++# Keymaster.  Without an IKeymasterDevice server, android::vold::Keymaster's
++# constructor aborts: vold dies 13 s into boot, ro.crypto.state is never set, and
++# the "on zygote-start && property:ro.crypto.state=unencrypted" trigger never
++# fires, so zygote and system_server never start and the handset sits on the
++# bootloader logo until the watchdog resets it.  wait_for_keymaster crashes in
++# the same constructor.  This device has no TEE, but KeymasterDevice.cpp falls
++# back to SoftKeymasterDevice when hw_get_module_by_class(KEYSTORE_HARDWARE_MODULE_ID)
++# fails, so the stock 3.0 default implementation is exactly what is wanted here.
++# 4.0, not 3.0.  vold's Keymaster is built on the 4.0 support library, and
++# although that library does enumerate 3.0 devices through a wrapper, its
++# performHmacKeyAgreement() and the SecurityLevel handling are 4.0 concepts -
++# with only a 3.0 HAL present, wait_for_keymaster died every five seconds and
++# init, which runs it with exec_start, never got past it, so class main and
++# therefore zygote never started.
++# android.hardware.keymaster@4.0-service is pure software
++# (CreateKeymasterDevice(SecurityLevel::SOFTWARE)), needs no secure hardware,
++# registers itself rather than being a passthrough, and starts in class
++# early_hal - which is before vold in post-fs-data.
++PRODUCT_PACKAGES += \
++    android.hardware.keymaster@4.0-service
+ 
+ # Bluetooth HAL
+ PRODUCT_PACKAGES += \
+@@ -254,9 +332,11 @@ android.hardware.bluetooth@1.0-impl
+ PRODUCT_PACKAGES += \
+ wificond
+ 
+-# Wifi
+-PRODUCT_PACKAGES += \
+-android.hardware.wifi@1.0-service
++# Wifi vendor HAL: NOT built.  libwifi-hal loads the driver with finit_module(2),
++# a syscall from Linux 3.8; this kernel is 3.4, so the service dies at startup
++# every time ("finit_module return: -1: Function not implemented").  The HAL
++# entry is also removed from manifest.xml - see the comment there.
++# PRODUCT_PACKAGES += android.hardware.wifi@1.0-service
+ 
+ # USB HAL
+ PRODUCT_PACKAGES += \
+@@ -289,12 +369,11 @@ android.hardware.configstore@1.0_hal \
+ android.hardware.configstore@1.0-service \
+ android.hardware.configstore-utils \
+ android.hardware.graphics.allocator@2.0 \
++android.hardware.graphics.allocator@2.0-impl \
+ android.hardware.graphics.composer@2.1-impl \
+ android.hardware.graphics.mapper@2.0-impl
+ 
+-# Keymaster
+-#PRODUCT_PACKAGES += \
+-#    android.hardware.keymaster@3.0-impl
++# Keymaster: see the PRODUCT_PACKAGES block above.
+ 	
+ # Camera legacy
+ PRODUCT_PACKAGES += \
+@@ -329,19 +408,29 @@ PRODUCT_PACKAGES += \
+ #    android.hardware.gatekeeper@1.0-service \
+ #    android.hardware.gatekeeper@1.0-impl
+ 
+-# Audio
+-#PRODUCT_PACKAGES += \
+-#    android.hardware.audio@2.0-impl \
+-#    android.hardware.audio.effect@2.0-impl \
+-#    android.hardware.broadcastradio@1.0-impl
+-#    android.hardware.soundtrigger@2.0-impl
++# Audio.  The vendor manifest declares both of these as passthrough, so the
++# impl libraries must be installed under /vendor/lib/hw or the factory lookup
++# finds nothing:
++#   hwservicemanager: Cannot find entry android.hardware.audio@5.0::IDevicesFactory
++# broadcastradio and soundtrigger stay out - this handset has neither.
++PRODUCT_PACKAGES += \
++    android.hardware.audio@2.0-impl \
++    android.hardware.audio.effect@2.0-impl
+ 
+ # Hardware repo
+ $(call inherit-product, hardware/u8500/Android.mk)
+ 
++# hwcomposer.montblanc is deliberately absent from the list below.  It is an
++# HWC 1.0 blob and Android 10's composer rejects it outright:
++#   E ComposerHal: hwcomposer 1.0 is not supported
++#   F HwcComposer: failed to get hwcomposer service
++# With no hwcomposer module installed, HwcLoader falls back to the gralloc
++# module and HWC2OnFbAdapter drives the framebuffer directly, which works:
++#   I ComposerHal: falling back to gralloc module
++#   I gralloc: id = mcde_fb  480x800  60.00 Hz
++#   I HWComposer: Switching to legacy multi-display mode
+ PRODUCT_PACKAGES += \
+     gralloc.montblanc \
+-    hwcomposer.montblanc \
+     copybit.montblanc \
+     libstelpcutils \
+     libste_omxil-interface \
+@@ -355,3 +444,32 @@ PRODUCT_PACKAGES += \
+     gps.montblanc \
+     libsecril-shim \
+ 	su
++
++# JIT KAPALI.  ART'in JitCodeCache'i kod onbellegi icin cift gorunumlu bir
++# esleme kurmaya calisiyor (memfd_create + iki mmap); memfd_create cekirdek
++# 3.17'de geldi, bu cekirdek 3.4, cagri ENOSYS donuyor ve geri dusulen tek
++# eslemeli yolda mspace_malloc kendi defterini calistirilabilir sayfaya
++# yaziyor -> SEGV_ACCERR.
++#
++# Olculdu (25 Agustos, tombstone_42/44/46):
++#   Jit thread pool >>> system_server <<<  SIGSEGV code 2 (SEGV_ACCERR)
++#   mspace_malloc+2014 <- JitCodeCache::CommitCodeInternal <- JitCompile
++# system_server bunun uzerine olup olup basliyordu; boot yine bitmiyordu.
++#
++# Bedeli kucuk: imajdaki her uygulama dexpreopted (her /system/*-app/*/oat/arm
++# icinde gercek .odex + .vdex var, boot classpath .art/.oat olarak derli), yani
++# boot yolunda JIT'e ihtiyac yok.  Yorumlanan kod sadece calisma aninda uretilen
++# yerlerde kalir.
++PRODUCT_PROPERTY_OVERRIDES += \
++    dalvik.vm.usejit=false \
++    dalvik.vm.usejitprofiles=false
++
++# Codec2 (CCodec) BU CIHAZDA KULLANILAMAZ.
++# Cekirdekte CONFIG_ION yok, C2AllocatorIon::ion_open() her zaman basarisiz ve
++# Codec2'nin butun linear buffer yolu ION'a dayaniyor.  Cihazda Codec2
++# component'i de yok - elimizde ST'nin OMX component'leri var
++# (OMX.ST.VFM.H264Enc/Dec, MPEG4, VC1).  Android 10 varsayilan olarak CCodec'i
++# seciyor ve bu yol system_server'i olduruyordu.
++# 0 = hicbir zaman CCodec kullanma, ACodec/OMX'e dus.
++PRODUCT_PROPERTY_OVERRIDES += \
++    debug.stagefright.ccodec=0
+diff --git a/golden.mk.yedek b/golden.mk.yedek
+new file mode 100644
+index 0000000..7bb15a3
+--- /dev/null
++++ b/golden.mk.yedek
+@@ -0,0 +1,361 @@
++#
++# Copyright (C) 2013 The Android Open Source Project
++# Copyright (C) 2013 Óliver García Albertos (oliverarafo@gmail.com)
++# Copyright (C) 2014 Jonathan Jason Dennis (theonejohnnyd@gmail.com)
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#      http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++
++DEVICE_PACKAGE_OVERLAYS += $(LOCAL_PATH)/overlay
++
++# Inherit from those products. Most specific first.
++$(call inherit-product, build/target/product/full_base_telephony.mk)
++$(call inherit-product, build/target/product/languages_full.mk)
++
++# Use the Dalvik VM specific for devices with 1024 MB of RAM
++$(call inherit-product, frameworks/native/build/phone-xhdpi-1024-dalvik-heap.mk)
++
++# Inherit the proprietary vendors blobs.
++$(call inherit-product, vendor/samsung/golden/golden-vendor.mk)
++
++# Ramdisk
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/rootdir/ueventd.samsunggolden.rc:root/ueventd.samsunggolden.rc \
++    $(LOCAL_PATH)/rootdir/fstab.samsunggolden:$(TARGET_COPY_OUT_RAMDISK)/fstab.samsunggolden \
++    $(LOCAL_PATH)/rootdir/fstab.samsunggolden:root/fstab.samsunggolden \
++    $(LOCAL_PATH)/rootdir/init.samsunggolden.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/hw/init.samsunggolden.rc \
++    $(LOCAL_PATH)/rootdir/init.samsunggolden.usb.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/hw/init.samsunggolden.usb.rc \
++    $(LOCAL_PATH)/rootdir/init.ste.rc:$(TARGET_COPY_OUT_VENDOR)/etc/init/hw/init.ste.rc
++
++# Recovery ramdisk, libraries and modules.
++# recovery/root/etc used to be a real directory; in Android 10's ramdisk /etc is
++# a symlink to /system/etc, so copying files into it makes the recovery ramdisk
++# rule fail ("could not make way for new symlink: root/etc").  recovery.fstab is
++# already installed at root/system/etc by the standard rule, and twrp.fstab is
++# only wanted by a TWRP that this tree does not build - bootable/recovery-twrp
++# is not part of LineageOS 17.1.
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/recovery/rootdir/sbin/libkeyutils.so:recovery/root/sbin/libkeyutils.so \
++    $(LOCAL_PATH)/recovery/rootdir/sbin/libsec_km.so:recovery/root/sbin/libsec_km.so \
++    $(LOCAL_PATH)/recovery/rootdir/sbin/libsec_ecryptfs.so:recovery/root/sbin/libsec_ecryptfs.so 
++
++# Inputs
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/usr/keylayout/gpio-keys.kl:system/usr/keylayout/gpio-keys.kl \
++    $(LOCAL_PATH)/configs/usr/keylayout/sec_touchkey.kl:system/usr/keylayout/sec_touchkey.kl
++
++# Graphics
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/lib/egl/egl.cfg:system/lib/egl/egl.cfg
++
++PRODUCT_PROPERTY_OVERRIDES += \
++    debug.sf.hw=1 \
++    ro.zygote.disable_gl_preload=true \
++    ro.bq.gpu_to_cpu_unsupported=1 \
++    ro.opengles.version=131072 \
++    debug.hwui.render_dirty_regions=false \
++    persist.sys.use_dithering=2 \
++    persist.sys.strictmode.disable=1
++
++# Ril
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/etc/spn-conf.xml:system/etc/spn-conf.xml
++
++# Media
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/etc/media_profiles.xml:system/etc/media_profiles.xml \
++    $(LOCAL_PATH)/configs/etc/media_codecs.xml:system/etc/media_codecs.xml \
++    $(LOCAL_PATH)/configs/omxloaders:system/omxloaders \
++    frameworks/av/media/libstagefright/data/media_codecs_google_audio.xml:system/etc/media_codecs_google_audio.xml \
++    frameworks/av/media/libstagefright/data/media_codecs_google_telephony.xml:system/etc/media_codecs_google_telephony.xml \
++    frameworks/av/media/libstagefright/data/media_codecs_google_video.xml:system/etc/media_codecs_google_video.xml
++
++PRODUCT_PROPERTY_OVERRIDES += \
++    ste.nmf.autoidle=1 \
++    ste.video.dec.mpeg4.in.size=8192 \
++    ste.video.enc.out.buffercnt=5 \
++    ste.video.dec.recycle.delay=1 \
++    ste.omx.ctx=0
++
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/bin/usbid_init.sh:system/bin/usbid_init.sh \
++
++# Media
++PRODUCT_PROPERTY_OVERRIDES += \
++    media.stagefright.use-awesome=1
++
++# Screen
++PRODUCT_PROPERTY_OVERRIDES += \
++    ro.sf.lcd_density=240 \
++    ro.sf.display_rotation=0 \
++    ro.lcd_brightness=170 \
++    ro.lcd_min_brightness=30
++
++# Camera
++PRODUCT_PROPERTY_OVERRIDES += \
++    ste.cam.front.orientation=270 \
++    ste.cam.back.orientation=90 \
++    ste.cam.ext.cfg.path.secondary=/system/usr/share/camera/config_file/aptina_mt9v113.dat
++# enable Snap
++PRODUCT_PACKAGES += \
++    Snap
++
++# Wifi
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/etc/wifi/wpa_supplicant.conf:system/etc/wifi/wpa_supplicant.conf \
++    $(LOCAL_PATH)/configs/etc/wifi/wpa_supplicant_overlay.conf:system/etc/wifi/wpa_supplicant_overlay.conf \
++    $(LOCAL_PATH)/configs/etc/wifi/p2p_supplicant_overlay.conf:system/etc/wifi/p2p_supplicant_overlay.conf
++
++PRODUCT_PACKAGES += \
++    dhcpcd.conf \
++    hostapd \
++    hostapd_default.conf \
++    libnetcmdiface \
++    wpa_supplicant \
++    wpa_supplicant.conf
++
++PRODUCT_PROPERTY_OVERRIDES += \
++    wifi.interface=wlan0 \
++    wifi.supplicant_scan_interval=150 \
++    ro.wifihal.screenstate=0
++
++# Bluetooth
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/etc/bluetooth/bt_vendor.conf:system/etc/bluetooth/bt_vendor.conf
++
++# RIL
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/etc/ste_modem.sh:system/etc/ste_modem.sh \
++    $(LOCAL_PATH)/configs/etc/cspsa.conf:system/etc/cspsa.conf
++
++PRODUCT_PACKAGES += \
++    libstlport \
++    libjhead \
++    libjhead_jni
++
++PRODUCT_PROPERTY_OVERRIDES += \
++    ro.telephony.call_ring.multiple=false \
++    ro.telephony.ril_class=SamsungU8500RIL \
++    ro.telephony.sends_barcount=1 \
++    ro.telephony.default_network=0 \
++    ro.telephony.ipasgatew=1
++
++
++# GPS
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/etc/sirfgps.conf:system/etc/sirfgps.conf \
++    $(LOCAL_PATH)/configs/etc/gps.conf:system/etc/gps.conf
++
++# Audio
++PRODUCT_COPY_FILES += \
++    $(LOCAL_PATH)/configs/etc/audio_policy.conf:system/etc/audio_policy.conf \
++    $(LOCAL_PATH)/configs/etc/asound.conf:system/etc/asound.conf
++
++PRODUCT_PACKAGES += \
++    audio.a2dp.default \
++    audio.r_submix.default \
++    audio.usb.default 
++
++# Enable repeatable keys in cwm
++PRODUCT_PROPERTY_OVERRIDES += \
++    ro.cwm.enable_key_repeat=true \
++    ro.cwm.repeatable_keys=114,115
++
++# USB
++PRODUCT_PROPERTY_OVERRIDES += \
++    persist.sys.usb.config=mtp,adb \
++    persist.service.adb.enable=1 \
++    ste.special_fast_dormancy=false
++
++# Charger
++# Charger Prebuilt (temporary solution for lollipop)
++# Use prebuilt charger and images from KitKat
++#PRODUCT_COPY_FILES += \
++#    $(LOCAL_PATH)/prebuilt/charger/charger:root/sbin/charger \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_0.png:root/res/images/charger/battery_0.png \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_1.png:root/res/images/charger/battery_1.png \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_2.png:root/res/images/charger/battery_2.png \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_3.png:root/res/images/charger/battery_3.png \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_4.png:root/res/images/charger/battery_4.png \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_5.png:root/res/images/charger/battery_5.png \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_charge.png:root/res/images/charger/battery_charge.png \
++#    $(LOCAL_PATH)/prebuilt/charger/images/battery_fail.png:root/res/images/charger/battery_fail.png \
++
++# Permissions
++PRODUCT_COPY_FILES += \
++    frameworks/native/data/etc/android.hardware.telephony.gsm.xml:system/etc/permissions/android.hardware.telephony.gsm.xml \
++    frameworks/native/data/etc/android.hardware.bluetooth_le.xml:system/etc/permissions/android.hardware.bluetooth_le.xml \
++    frameworks/native/data/etc/android.hardware.wifi.direct.xml:system/etc/permissions/android.hardware.wifi.direct.xml \
++    frameworks/native/data/etc/handheld_core_hardware.xml:system/etc/permissions/handheld_core_hardware.xml \
++    frameworks/native/data/etc/android.hardware.bluetooth.xml:system/etc/permissions/android.hardware.bluetooth.xml \
++    frameworks/native/data/etc/android.hardware.camera.flash-autofocus.xml:system/etc/permissions/android.hardware.camera.flash-autofocus.xml \
++    frameworks/native/data/etc/android.hardware.camera.front.xml:system/etc/permissions/android.hardware.camera.front.xml \
++    frameworks/native/data/etc/android.hardware.location.gps.xml:system/etc/permissions/android.hardware.location.gps.xml \
++    frameworks/native/data/etc/android.hardware.sensor.accelerometer.xml:system/etc/permissions/android.hardware.sensor.accelerometer.xml \
++    frameworks/native/data/etc/android.hardware.sensor.compass.xml:system/etc/permissions/android.hardware.sensor.compass.xml \
++    frameworks/native/data/etc/android.hardware.sensor.gyroscope.xml:system/etc/permissions/android.hardware.sensor.gyroscope.xml \
++    frameworks/native/data/etc/android.hardware.sensor.proximity.xml:system/etc/permissions/android.hardware.sensor.proximity.xml \
++    frameworks/native/data/etc/android.hardware.sensor.light.xml:system/permissions/android.hardware.sensor.light.xml \
++    frameworks/native/data/etc/android.hardware.touchscreen.multitouch.jazzhand.xml:system/etc/permissions/android.hardware.touchscreen.multitouch.jazzhand.xml \
++    frameworks/native/data/etc/android.hardware.usb.accessory.xml:system/etc/permissions/android.hardware.usb.accessory.xml \
++    frameworks/native/data/etc/android.hardware.usb.host.xml:system/etc/permissions/android.hardware.usb.host.xml \
++    frameworks/native/data/etc/android.hardware.wifi.xml:system/etc/permissions/android.hardware.wifi.xml \
++    frameworks/native/data/etc/android.software.sip.voip.xml:system/etc/permissions/android.software.sip.voip.xml
++
++# Filesystem management tools
++PRODUCT_PACKAGES += \
++    make_ext4fs \
++    setup_fs
++
++# Misc packages
++PRODUCT_PACKAGES += \
++    Torch \
++    com.android.future.usb.accessory
++
++# Non-device-specific props
++PRODUCT_PROPERTY_OVERRIDES += \
++    ro.com.google.locationfeatures=1 \
++    ro.setupwizard.mode=OPTIONAL \
++    ro.setupwizard.enable_bypass=1 \
++    ro.config.sync=yes \
++    ro.config.low_ram=true \
++    persist.traced.enable=1
++
++# Define kind of DPI
++PRODUCT_AAPT_CONFIG := normal hdpi
++PRODUCT_AAPT_PREF_CONFIG := hdpi
++
++# We have enough storage space to hold precise GC data
++PRODUCT_TAGS += dalvik.gc.type-precise
++
++# HIDL
++DEVICE_MANIFEST_FILE := $(LOCAL_PATH)/manifest.xml
++
++# Bluetooth
++PRODUCT_PACKAGES += \
++libbt-vendor
++
++#
++#PRODUCT_PACKAGES += \
++#android.hardware.keymaster@3.0-service \
++#android.hardware.keymaster@3.0-impl
++
++# Bluetooth HAL
++PRODUCT_PACKAGES += \
++android.hardware.bluetooth@1.0-impl
++
++# wificond
++PRODUCT_PACKAGES += \
++wificond
++
++# Wifi
++PRODUCT_PACKAGES += \
++android.hardware.wifi@1.0-service
++
++# USB HAL
++PRODUCT_PACKAGES += \
++android.hardware.usb@1.0-service
++
++# Power
++PRODUCT_PACKAGES += \
++android.hardware.power@1.0-impl
++
++# vibrato
++PRODUCT_PACKAGES += \
++android.hardware.vibrator@1.0-impl
++
++# GNSS HAL
++PRODUCT_PACKAGES += \
++android.hardware.gnss@1.0-impl
++
++# RenderScript HAL
++PRODUCT_PACKAGES += \
++android.hardware.renderscript@1.0-impl
++
++# DRM
++PRODUCT_PACKAGES += \
++android.hardware.drm@1.0-impl
++
++# graphics HIDL interfaces
++PRODUCT_PACKAGES += \
++android.hardware.graphics.bufferqueue@1.0_hal \
++android.hardware.configstore@1.0_hal \
++android.hardware.configstore@1.0-service \
++android.hardware.configstore-utils \
++android.hardware.graphics.allocator@2.0 \
++android.hardware.graphics.composer@2.1-impl \
++android.hardware.graphics.mapper@2.0-impl
++
++# Keymaster
++#PRODUCT_PACKAGES += \
++#    android.hardware.keymaster@3.0-impl
++	
++# Camera legacy
++PRODUCT_PACKAGES += \
++    android.hardware.camera.provider@2.4-impl-legacy \
++    camera.device@1.0-impl-legacy
++
++# Camera
++#PRODUCT_PACKAGES += \
++#    android.hardware.camera.provider@2.4-impl \
++#    camera.device@1.0-impl
++
++# health
++PRODUCT_PACKAGES += \
++    android.hardware.health@1.0-impl
++
++# Lights
++PRODUCT_PACKAGES += \
++    android.hardware.light@2.0-impl
++
++# memtrack
++PRODUCT_PACKAGES += \
++    android.hardware.memtrack@1.0-impl
++
++PRODUCT_PACKAGES += \
++    android.hardware.sensors@1.0-impl
++
++PRODUCT_PACKAGES += \
++    input.evdev.default
++
++# Gatekeeper HAL
++#PRODUCT_PACKAGES += \
++#    android.hardware.gatekeeper@1.0-service \
++#    android.hardware.gatekeeper@1.0-impl
++
++# Audio
++#PRODUCT_PACKAGES += \
++#    android.hardware.audio@2.0-impl \
++#    android.hardware.audio.effect@2.0-impl \
++#    android.hardware.broadcastradio@1.0-impl
++#    android.hardware.soundtrigger@2.0-impl
++
++# Hardware repo
++$(call inherit-product, hardware/u8500/Android.mk)
++
++PRODUCT_PACKAGES += \
++    gralloc.montblanc \
++    hwcomposer.montblanc \
++    copybit.montblanc \
++    libstelpcutils \
++    libste_omxil-interface \
++    libnmf \
++    libasound \
++    lights.montblanc \
++    power.montblanc \
++    libblt_hw \
++    libomxil-bellagio \
++    camera.montblanc \
++    gps.montblanc \
++    libsecril-shim \
++	su
+diff --git a/lineage_golden.mk b/lineage_golden.mk
+index 4034d0c..053b93e 100644
+--- a/lineage_golden.mk
++++ b/lineage_golden.mk
+@@ -34,3 +34,10 @@ TARGET_SCREEN_WIDTH := 480
+ # Set build fingerprint and ID
+ #BUILD_ID := TRIANA00$(shell date -u +%Y%m%d)
+ #PRODUCT_BUILD_PROP_OVERRIDES += PRODUCT_NAME=cm_golden BUILD_FINGERPRINT=cyanogenmod/cm_golden/golden:4.4.2/$(BUILD_ID) PRIVATE_BUILD_DESC="SGH-T599X 4.4.2"
++
++# --- sirsch ---------------------------------------------------------------
++# Inherited last on purpose: PRODUCT_PROPERTY_OVERRIDES set here beat whatever
++# the Lineage config put in earlier, and the overlay directory this adds is
++# searched after device/samsung/golden's, so the device keeps ownership of the
++# panel-specific resources it already defines.
++$(call inherit-product, vendor/sirsch/config/sirsch.mk)
+diff --git a/manifest.xml b/manifest.xml
+index 10e8007..d396422 100644
+--- a/manifest.xml
++++ b/manifest.xml
+@@ -108,17 +108,19 @@
+             <instance>default</instance>
+         </interface>
+     </hal>
+-<!--
++    <!-- The software keymaster, android.hardware.keymaster@4.0-service.  It has
++         to be 4.0: vold and wait_for_keymaster are built on the 4.0 support
++         library and a 3.0-only device leaves wait_for_keymaster crash-looping,
++         which blocks init and stops class main from ever starting. -->
+     <hal format="hidl">
+         <name>android.hardware.keymaster</name>
+-        <transport arch="32">passthrough</transport>
+-        <version>3.0</version>
++        <transport>hwbinder</transport>
++        <version>4.0</version>
+         <interface>
+             <name>IKeymasterDevice</name>
+             <instance>default</instance>
+         </interface>
+     </hal>
+--->
+     <hal format="hidl">
+         <name>android.hardware.light</name>
+         <transport arch="32">passthrough</transport>
+@@ -195,37 +197,36 @@
+             <instance>default</instance>
+         </interface>
+     </hal>
+-    <hal format="hidl">
+-        <name>android.hardware.wifi</name>
+-        <transport>hwbinder</transport>
+-        <version>1.0</version>
+-        <interface>
+-            <name>IWifi</name>
+-            <instance>default</instance>
+-        </interface>
+-    </hal>
+-    <hal format="hidl">
+-        <name>android.hardware.wifi.offload</name>
+-        <transport>hwbinder</transport>
+-        <version>1.0</version>
+-        <interface>
+-            <name>IOffload</name>
+-            <instance>default</instance>
+-        </interface>
+-    </hal>
+-    <hal format="hidl">
+-        <name>android.hardware.wifi.hostapd</name>
+-        <transport>hwbinder</transport>
+-        <version>1.0</version>
+-        <interface>
+-            <name>IHostapd</name>
+-            <instance>default</instance>
+-        </interface>
+-    </hal>
++<!-- android.hardware.wifi (IWifi) DELIBERATELY ABSENT.
++
++     There is no working vendor HAL on this device and declaring one is worse
++     than declaring none.  Measured on 25 August:
++
++         android.hardware.wifi@1.0-service: finit_module return: -1:
++             Function not implemented
++         android.hardware.wifi@1.0-service: Failed to load WiFi driver
++         HalDevMgr: Cannot start IWifi: 9
++
++     libwifi-hal insists on inserting the driver itself and does it with
++     finit_module(2), which arrived in Linux 3.8.  This kernel is 3.4, so the
++     call can never succeed - and the driver is already loaded anyway, which
++     the HAL does not check.
++
++     With the entry gone, HalDeviceManager sees no IWifi in the manifest, logs
++     "Vendor Hal not supported, ignoring start" and returns true, and the
++     framework proceeds to wificond + supplicant.  AOSP's own documentation
++     says the vendor HAL "is optional (not required) for infrastructure
++     Station (STA) and Soft AP (SAP) modes to function".
++
++     Given up with it: GScan/PNO offload, RTT, Aware, MAC randomization.
++     Kept: scanning, WPA2, DHCP - ordinary WiFi. -->
++<!-- android.hardware.wifi.offload: no implementation is built for this device. -->
++<!-- android.hardware.wifi.hostapd: no HIDL service is built (golden.mk ships the
++     hostapd binary only), so declaring the interface was a false claim. -->
+     <hal format="hidl">
+         <name>android.hardware.wifi.supplicant</name>
+         <transport>hwbinder</transport>
+-        <version>1.0</version>
++        <version>1.2</version>
+         <interface>
+             <name>ISupplicant</name>
+             <instance>default</instance>
+diff --git a/manifest.xml.yedek b/manifest.xml.yedek
+new file mode 100644
+index 0000000..10e8007
+--- /dev/null
++++ b/manifest.xml.yedek
+@@ -0,0 +1,245 @@
++<manifest version="1.0" type="device">
++    <hal format="hidl">
++        <name>android.hardware.audio</name>
++        <transport arch="32">passthrough</transport>
++        <version>2.0</version>
++        <interface>
++            <name>IDevicesFactory</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.audio.effect</name>
++        <transport arch="32">passthrough</transport>
++        <version>2.0</version>
++        <interface>
++            <name>IEffectsFactory</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.bluetooth</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IBluetoothHci</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.camera.provider</name>
++        <transport arch="32">passthrough</transport>
++        <version>2.4</version>
++        <interface>
++            <name>ICameraProvider</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.configstore</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ISurfaceFlingerConfigs</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.drm</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IDrmFactory</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.gnss</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IGnss</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.health</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IHealth</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.renderscript</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IDevice</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.graphics.allocator</name>
++        <transport arch="32">passthrough</transport>
++        <version>2.0</version>
++        <interface>
++            <name>IAllocator</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.graphics.mapper</name>
++        <transport arch="32">passthrough</transport>
++        <version>2.0</version>
++        <interface>
++            <name>IMapper</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.graphics.composer</name>
++        <transport arch="32">passthrough</transport>
++        <impl level="generic"></impl>
++        <version>2.1</version>
++        <interface>
++            <name>IComposer</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++<!--
++    <hal format="hidl">
++        <name>android.hardware.keymaster</name>
++        <transport arch="32">passthrough</transport>
++        <version>3.0</version>
++        <interface>
++            <name>IKeymasterDevice</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++-->
++    <hal format="hidl">
++        <name>android.hardware.light</name>
++        <transport arch="32">passthrough</transport>
++        <version>2.0</version>
++        <interface>
++            <name>ILight</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.memtrack</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IMemtrack</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.power</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IPower</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.radio</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IRadio</name>
++            <instance>slot1</instance>
++        </interface>
++        <interface>
++            <name>ISap</name>
++            <instance>slot1</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.radio.deprecated</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IOemHook</name>
++            <instance>slot1</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.sensors</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ISensors</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.usb</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IUsb</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.vibrator</name>
++        <transport arch="32">passthrough</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IVibrator</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.wifi</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IWifi</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.wifi.offload</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IOffload</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.wifi.hostapd</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>IHostapd</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++    <hal format="hidl">
++        <name>android.hardware.wifi.supplicant</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ISupplicant</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++<!--
++    <hal format="hidl">
++        <name>vendor.lineage.power</name>
++        <transport>hwbinder</transport>
++        <version>1.0</version>
++        <interface>
++            <name>ILineagePower</name>
++            <instance>default</instance>
++        </interface>
++    </hal>
++-->
++</manifest>
+\ No newline at end of file
+diff --git a/overlay/frameworks/base/core/res/res/values/config.xml b/overlay/frameworks/base/core/res/res/values/config.xml
+index b748e9c..e9fb9b5 100644
+--- a/overlay/frameworks/base/core/res/res/values/config.xml
++++ b/overlay/frameworks/base/core/res/res/values/config.xml
+@@ -87,6 +87,13 @@
+          config to 7.
+     <integer name="config_deviceHardwareKeys">7</integer> -->
+ 
++    <!-- golden: guc tusu FIZIKSEL OLARAK SOKULDU (25 Agustos).  Cihazin
++         donanim tuslari bildirilmezse LineageOS'un tus eylemleri hic devreye
++         girmiyor ve Home'a uzun basmak uyku moduna alamiyor - guc tusu olmayan
++         bir telefonda ekrani kapatmanin baska yolu kalmiyor.
++         Home(1) + Back(2) + Menu(4) + Volume(64) = 71 -->
++    <integer name="config_deviceHardwareKeys">71</integer>
++
+     <!-- Boolean to enable stk functionality on Samsung phones -->
+     <!--<bool name="config_samsung_stk">true</bool>-->
+ 
+@@ -97,10 +104,10 @@
+     <bool name="config_ui_enableFadingMarquee">true</bool>
+ 
+     <!-- Minimum screen brightness allowed by the power manager. -->
+-    <integer name="config_screenBrightnessDim">20</integer>
++    <integer name="config_screenBrightnessDim">10</integer>
+ 
+     <!-- If this is true, the screen will come on when you unplug usb/power/whatever. -->
+-    <bool name="config_unplugTurnsOnScreen">true</bool>
++    <bool name="config_unplugTurnsOnScreen">false</bool>
+ 
+     <!-- If this is true, the screen will fade off. -->
+     <bool name="config_animateScreenLights">false</bool>
+@@ -146,12 +153,19 @@
+     in the config_autoBrightnessLevels array.  This array should have size one greater
+     than the size of the config_autoBrightnessLevels array.
+     This must be overridden in platform specific overlays -->
++    <!-- Lowered across the board.  This is an AMOLED panel: a black pixel draws
++         no current at all, so the backlight value is most of the screen's power
++         draw and the indoor step is where the phone actually spends its day.
++         Stock was 20/30/110/175/255; 110 at 75-1000 lux is far brighter than a
++         lit room needs, and it is also harsher than it needs to be to read.
++         Outdoor steps are cut less, because losing legibility in sunlight is a
++         worse trade than the power it saves. -->
+     <integer-array name="config_autoBrightnessLcdBacklightValues">
+-        <item>20</item> <!-- (0 - 7) Very dark room -->
+-        <item>30</item> <!-- (7 - 75) Poor light ambient -->
+-        <item>110</item> <!-- (75 - 1000) Indoor / shadows -->
+-        <item>175</item> <!-- (1000 - 10000) Outdoor-->
+-        <item>255</item> <!-- (10000 - 16000) Sunlight outdoor -->
++        <item>12</item>  <!-- (0 - 7) Very dark room -->
++        <item>20</item>  <!-- (7 - 75) Poor light ambient -->
++        <item>60</item>  <!-- (75 - 1000) Indoor / shadows -->
++        <item>130</item> <!-- (1000 - 10000) Outdoor -->
++        <item>220</item> <!-- (10000 - 16000) Sunlight outdoor -->
+     </integer-array>
+     
+     <!-- Array of output values for button backlight corresponding to the LUX values
+@@ -166,5 +180,12 @@
+         <item>0</item> <!-- (10000 - 16000) Sunlight outdoor -->
+     </integer-array>
+ 
++    <!-- sirsch: dark is the ground state, not a setting to be found later.  On
++         this AMOLED an unlit pixel draws no current. -->
++    <integer name="config_defaultNightMode">2</integer>
++
++    <!-- sirsch: manual-mode default, used before the light sensor speaks and
++         whenever automatic brightness is off.  AOSP ships 102/255. -->
++    <integer name="config_screenBrightnessSettingDefault">56</integer>
+ </resources>
+ 
+diff --git a/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml b/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+new file mode 100644
+index 0000000..09a31dd
+--- /dev/null
++++ b/overlay/frameworks/base/packages/SettingsProvider/res/values/defaults.xml
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- First-boot settings.  This handset is provisioned over the network from a
++     laptop, so it has to come up reachable and without anything in the way. -->
++<resources>
++    <!-- Reachable at first boot: wifi on before anyone touches the screen. -->
++    <bool name="def_wifi_on">true</bool>
++    <!-- 2 = never sleep.  A node that drops off the network when the screen
++         blanks is not a node. -->
++    <integer name="def_wifi_sleep_policy">2</integer>
++
++    <!-- No lock screen: there is nothing on this device worth a swipe, and the
++         stock lock screen is exactly the Android furniture we are removing. -->
++    <bool name="def_lockscreen_disabled">true</bool>
++
++    <bool name="def_screen_brightness_automatic_mode">true</bool>
++    <integer name="def_screen_brightness">56</integer>
++    <integer name="def_screen_off_timeout">30000</integer>
++
++    <bool name="def_backup_enabled">false</bool>
++    <bool name="def_vibrate_when_ringing">false</bool>
++</resources>
+diff --git a/rootdir/fstab.samsunggolden b/rootdir/fstab.samsunggolden
+index 5a04bde..eb1a8d4 100644
+--- a/rootdir/fstab.samsunggolden
++++ b/rootdir/fstab.samsunggolden
+@@ -5,11 +5,21 @@
+ #TODO: Add 'check' as fs_mgr_flags with data partition.
+ # Currently we dont have e2fsck compiled. So fs check would failed.
+ 
++# 'nofail' on the secondary partitions: fs_mgr.cpp:1302 only skips ++error_count
++# when no_fail is set, and any error_count makes fs_mgr_mount_all() return
++# FS_MGR_MNTALL_FAIL.  do_mount_all() then never calls queue_fs_event(), so
++# ro.crypto.state stays unset and neither 'on nonencrypted' nor any
++# 'on zygote-start && property:ro.crypto.state=...' block matches - class main
++# is never started.  A missing /efs or /modemfs must break RIL, not booting.
+ #<src>                                                	<mnt_point>  <type>  <mnt_flags and options>                     <fs_mgr_flags>
+-/dev/block/mmcblk0p22									/system      ext4    rw,noatime                                											wait
+-/dev/block/mmcblk0p24									/preload     ext4    rw,noatime																			wait
++/dev/block/mmcblk0p22									/system      ext4    rw,noatime                                											wait,first_stage_mount
++# /preload (mmcblk0p24) is Samsung's preinstalled-app partition.  Nothing in
++# LineageOS reads it, it has no SELinux label so its mount point cannot be
++# baked into the system image, and a mount point that does not exist makes
++# fs_mgr count an error - which fails the whole mount_all and stops the boot.
++#/dev/block/mmcblk0p24									/preload     ext4    rw,noatime																			wait
+ /dev/block/mmcblk0p23									/cache       ext4    rw,noatime,nosuid,nodev															wait,formattable
+-/dev/block/mmcblk0p11									/efs         ext4    rw,nosuid,nodev,noatime															wait
++/dev/block/mmcblk0p11									/efs         ext4    rw,nosuid,nodev,noatime															wait,nofail
+ /dev/block/mmcblk0p25									/data        ext4    rw,noatime,nosuid,nodev,noauto_da_alloc,journal_async_commit,errors=continue		wait,formattable,encryptable=/efs/metadata
+ 
+ # External SD
+@@ -18,10 +28,22 @@
+ # recovery
+ /dev/block/mmcblk0p20                           /boot				emmc		defaults		recoveryonly
+ /dev/block/mmcblk0p21                           /recovery			emmc		defaults		recoveryonly
+-/dev/block/mmcblk0p12							/modemfs     		ext4    	rw,nosuid,nodev,noatime		wait,first_stage_mount
++/dev/block/mmcblk0p12							/modemfs     		ext4    	rw,nosuid,nodev,noatime		wait,nofail
+ 
+ # OTG
+ /devices/platform/musb-ux500.0/musb-hdrc*  	      auto	   auto	    defaults		  voldmanaged=usb:auto
+ 
+-# zRAM
+-/dev/block/zram0                                      none         swap    defaults               zramsize=134217728
++# zRAM - DISABLED, and it never actually worked on this kernel.
++# golden_defconfig asks for CONFIG_ZRAM=y, but Kconfig drops it silently: ZRAM
++# depends on ZSMALLOC, and the only zsmalloc in this tree (drivers/staging) is
++# the pre-3.9 x86-only one - its zs_map_object() uses raw set_pte() plus
++# __flush_tlb_one(), with no ARM path - and it is not even sourced from
++# drivers/staging/Kconfig.  On top of that the zram driver here is a 3.15-era
++# backport calling zs_get_total_pages() and the 3-argument zs_map_object(),
++# neither of which the old zsmalloc has.  So /dev/block/zram0 is never created
++# and this line was a no-op claiming 288 MB that did not exist.
++# fs_mgr_mount_all() skips swap entries and swapon_all failures are non-fatal,
++# so it did no harm either - it just was not true.
++# Re-enabling means backporting a modern zsmalloc to this 3.4 ARM kernel and
++# adapting the driver's calls.  That is a real kernel patch, not a config flip.
++#/dev/block/zram0                                      none         swap    defaults               zramsize=301989888
+diff --git a/rootdir/init.samsunggolden.rc b/rootdir/init.samsunggolden.rc
+index 0671a1a..3ce2cd2 100755
+--- a/rootdir/init.samsunggolden.rc
++++ b/rootdir/init.samsunggolden.rc
+@@ -4,14 +4,33 @@
+ import /system/vendor/etc/init/hw/init.samsunggolden.usb.rc
+ import /system/vendor/etc/init/hw/init.ste.rc
+ 
++# Every command removed from this block was measured failing on a real boot,
++# and each failure was a no-op, not a missing effect:
++#   mount -o remount,rw / | /system   -> "No such device".  init switches root
++#       to /system, so "/" IS the read-only system partition; there is nothing
++#       to remount.
++#   mount cgroup none /acct cpuacct   -> "Device or resource busy".  /init.rc
++#       already mounted it in its own "on init", which runs first.
++#   mkdir /storage/emulated | /storage/sdcard1 | /storage/usbdisk,
++#   symlink .../storage/sdcard0 | /extSdCard | /external_sd | /usbdisk
++#       -> "Read-only file system".  These are Android 4 leftovers.  In
++#       Android 10 /storage is a bind of /mnt/runtime/default set up in
++#       /init.rc "on post-fs", so anything created here at "on init" time
++#       lands on the read-only root and is then hidden by that bind anyway.
++#   mkdir /modemfs | /preload         -> "Read-only file system", and this is
++#       the pair that used to stop the boot: the missing mount point made
++#       fs_mgr count an error, fs_mgr_mount_all() returned FS_MGR_MNTALL_FAIL,
++#       queue_fs_event() never ran, ro.crypto.state was never set and
++#       class main never started.  /modemfs is baked into the image now
++#       (BOARD_ROOT_EXTRA_FOLDERS) and /preload is out of the fstab.
++# mkdir /efs, /tmp and /debug are kept: those directories do exist in the image
++# and only their fchmodat fails, so they cost nothing and still document the
++# intended modes.  A few /sdcard symlinks below are in the same category - they
++# fail with EEXIST or on the read-only root and are left alone rather than
++# churned, since /init.rc already makes the ones Android 10 actually uses.
+ on init
+-	mount -o remount,rw /
+-	mount -o remount,rw /system
+-	mount cgroup none /acct cpuacct
+     mkdir /acct/uid
+     mkdir /mnt/shell/emulated 0700 shell shell
+-    mkdir /storage 0550 system sdcard_r
+-    mkdir /storage/emulated 0555 root root
+ 
+ 	# By default, primary storage is physical
+     setprop ro.vold.primary_physical 1
+@@ -20,8 +39,6 @@ on init
+     mkdir /mnt/media_rw/sdcard1 0700 media_rw media_rw
+     mkdir /mnt/media_rw/usbdisk 0700 media_rw media_rw
+ 
+-    mkdir /storage/sdcard1 0700 root root
+-    mkdir /storage/usbdisk 0700 root root
+ 
+     export EXTERNAL_STORAGE /storage/emulated/0
+     export SECONDARY_STORAGE /storage/sdcard1
+@@ -31,19 +48,13 @@ on init
+     # For backwards compatibility
+     symlink /storage/emulated/legacy /sdcard
+     symlink /storage/emulated/legacy /mnt/sdcard
+-    symlink /storage/emulated/legacy /storage/sdcard0
+     symlink /mnt/shell/emulated/0 /storage/emulated/legacy
+-    symlink /storage/sdcard1 /extSdCard
+     symlink /storage/sdcard1 /mnt/extSdCard
+-    symlink /storage/sdcard1 /external_sd
+-    symlink /storage/usbdisk /usbdisk
+     symlink /storage/usbdisk /mnt/usbdisk
+     mkdir /mnt/runtime/default/emulated 0700 sdcard_rw sdcard_rw
+     mkdir /mnt/runtime/default/sdcard1 0700 sdcard_rw sdcard_rw
+ 
+-    mkdir /modemfs 0771 system system
+     mkdir /efs 0775 radio system
+-    mkdir /preload 0771 system system
+     mkdir /mnt 0775 root system
+     mkdir /mnt/.lfs 0755 root root
+     # Shared memory file system
+@@ -71,6 +82,28 @@ on charger
+     write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor powersave
+     write /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor powersave
+ 
++    # Be reachable while charging.
++    #
++    # init.cpp queues "charger" INSTEAD of "late-init" when ro.bootmode is
++    # charger - "don't mount filesystems or start core system services in
++    # charger mode" - so "on fs" never runs and the usb gadget is never
++    # enabled.  The handset then presents nothing at all on USB: no adb, no
++    # ttyACM, nothing.  A flat battery therefore turns into a device that
++    # cannot be talked to until a person holds the key combo, which is exactly
++    # how a night of unattended work gets lost.
++    #
++    # Enabling the gadget here also helps the charging itself: an enumerated
++    # device may draw 500 mA, an unenumerated one is held to 100 mA, and this
++    # handset is already failing to charge because VBUS sags under load.
++    # acm only - no mtp or adb, because neither has userspace in charger mode.
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions acm
++    write /sys/class/android_usb/android0/enable 1
++    start sirsch_konsol
++
+ on fs
+ 
+     mount_all /fstab.samsunggolden
+@@ -81,10 +114,28 @@ on fs
+     write /sys/class/android_usb/android0/idVendor 04E8
+     write /sys/class/android_usb/android0/idProduct 6860
+     write /sys/class/android_usb/android0/f_acm/instances 1
+-    write /sys/class/android_usb/android0/functions mtp,acm,adb
++    # rndis instead of mtp.
++    #
++    # mtp was dead weight: Android 10's MtpServer speaks FunctionFS and this
++    # kernel has CONFIG_USB_FUNCTIONFS unset, so nothing ever opened the
++    # kernel's /dev/mtp_usb and the interface just sat there.
++    #
++    # rndis, by contrast, is entirely in-kernel - no daemon, no association, no
++    # PSK, no regulatory domain - so it gives a usable network the moment the
++    # gadget binds, which is far earlier and far more reliably than either wifi
++    # or the acm console managed.  sirsch-izle.sh puts 192.168.42.2/24 on the
++    # resulting usb0; the host takes .1 (usb-ag.sh) and adb connects over TCP.
++    #
++    # Endpoint budget is fine: musb_hdrc_config.num_eps is 16
++    # (arch/arm/mach-ux500/usb.c:145) and rndis+acm+adb need 8.
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
+     write /sys/class/android_usb/android0/enable 1
+     start adbd
+-	setprop sys.usb.configfs 1
++    # No configfs gadget in this kernel (CONFIG_USB_G_ANDROID, legacy
++    # android_usb sysfs).  Setting this to 1 only made init.usb.configfs.rc
++    # fire blocks that write to /config/usb_gadget/... paths that do not
++    # exist; /init.usb.rc sets it to 0 in "on boot" regardless.
++    setprop sys.usb.configfs 0
+     setprop sys.usb.state mtp,adb
+ 
+ on post-fs
+@@ -297,8 +348,13 @@ on post-fs
+     chown radio system /debug/prcmu/ddr_opp
+     chmod 0660 /debug/prcmu/ape_opp
+     chmod 0660 /debug/prcmu/ddr_opp
+-    insmod /lib/modules/bthid.ko
++    # init loads these itself.  Android 10's init used finit_module(), which
++    # this 3.4 kernel does not have, so every one of these failed with ENOSYS
++    # and wlan0 never existed; init now falls back to init_module().  toybox
++    # insmod was tried instead for a while and returned EFAULT on its own
++    # fallback path, so the builtin is the one to use.
+     insmod /system/lib/modules/bthid.ko
++    insmod /system/lib/modules/dhd.ko firmware_path=/system/etc/wifi/bcmdhd_sta.bin nvram_path=/system/etc/wifi/nvram_net.txt
+ 
+     # AB8500 Fuelgauge initialization using PARAM capacity
+     # write /sys/class/power_supply/sec-fuelgauge/reinit_cap 1
+@@ -318,6 +374,11 @@ on post-fs-data
+     mkdir /data/misc/wifi 0770 wifi wifi
+     mkdir /data/misc/wifi/sockets 0770 wifi wifi
+     mkdir /data/misc/wifi/wpa_supplicant 0770 wifi wifi
++    # Android 10 supplicant writes its config and control sockets here.
++    mkdir /data/vendor 0771 root root
++    mkdir /data/vendor/wifi 0770 wifi wifi
++    mkdir /data/vendor/wifi/wpa 0770 wifi wifi
++    mkdir /data/vendor/wifi/wpa/sockets 0770 wifi wifi
+     mkdir /data/misc/dhcp 0770 dhcp dhcp
+ 
+     # Create directory for STE OMX debug logs
+@@ -472,10 +533,8 @@ on boot
+     class_start modem
+     class_start default
+ 
+-service charger /sbin/healthd -c
++service charger /system/bin/charger
+     class charger
+-    critical
+-    seclabel u:r:healthd:s0
+ 
+ # Crash Safe Parameter Storage Area, serving production parameter requests from clients.
+ # Configuration is read from file "/etc/cspsa.conf" and each found area spawns a CSPSA server
+@@ -521,19 +580,48 @@ service usbid_init /system/bin/usbid_init.sh
+     oneshot
+ 
+ 
+-# We must to setup two different services for p2p and wpa supplicants on bcm4334
+-service wpa_supplicant /system/bin/wpa_supplicant \
+-    -iwlan0 -Dnl80211 -c/data/misc/wifi/wpa_supplicant.conf \
+-    -I/system/etc/wifi/wpa_supplicant_overlay.conf \
+-    -O/data/misc/wifi/sockets \
+-    -e/data/misc/wifi/entropy.bin -g@android:wpa_wlan0
++# Legacy: Android 8 needed a second daemon for p2p on bcm4334.  Android 10
++# drives p2p through the same supplicant (-puse_p2p_group_interface=1p2p_device=1
++# above) and never starts this one.  Kept for reference only.
++# Android 10 form.  The old definition here was the Android 8 one and every
++# path in it was wrong for this supplicant:
++#
++#   * -c/data/misc/wifi/...  the config path is a COMPILE-TIME constant now,
++#     hidl/1.2/supplicant.cpp kStaIfaceConfPath = /data/vendor/wifi/wpa/
++#     wpa_supplicant.conf, and the daemon seeds it itself from the template in
++#     /vendor/etc/wifi.  The flag was ignored.
++#   * -O/data/misc/wifi/sockets  likewise: Android.mk bakes
++#     CONFIG_CTRL_IFACE_DIR=/data/vendor/wifi/wpa/sockets into the binary.
++#   * -e entropy.bin  gone in Android 10.
++#   * -iwlan0 -Dnl80211  the framework passes these through
++#     ISupplicant.addInterface(); passing them here makes the daemon claim the
++#     interface before HIDL does.
++#
++# The interface lines are the part that actually mattered.  SupplicantStaIfaceHal
++# .startDaemon() takes the lazy-HAL path when isV1_1() holds, and isV1_1() is
++# just "can hwservicemanager hand me @1.1::ISupplicant" - which it can only do
++# if init declared that FQName.  With 1.0 alone the daemon was never started at
++# all, which is exactly what we measured: registered in lshal, never running.
++#
++# The service NAME must stay wpa_supplicant: SupplicantStaIfaceHal
++# .INIT_SERVICE_NAME is that literal, and it is what the non-lazy fallback path
++# writes to ctl.start.  AOSP's own rc calls it vendor.wpa_supplicant; copying
++# that here would break the fallback.
++service wpa_supplicant /vendor/bin/hw/wpa_supplicant \
++    -O/data/vendor/wifi/wpa/sockets -puse_p2p_group_interface=1p2p_device=1 \
++    -g@android:wpa_wlan0
++    interface android.hardware.wifi.supplicant@1.0::ISupplicant default
++    interface android.hardware.wifi.supplicant@1.1::ISupplicant default
++    interface android.hardware.wifi.supplicant@1.2::ISupplicant default
+     class main
+     socket wpa_wlan0 dgram 660 wifi wifi
+     disabled
+     oneshot
+ 
+-# We must to setup two different services for p2p and wpa supplicants on bcm4334
+-service p2p_supplicant /system/bin/wpa_supplicant \
++# Legacy: Android 8 needed a second daemon for p2p on bcm4334.  Android 10
++# drives p2p through the same supplicant (-puse_p2p_group_interface=1p2p_device=1
++# above) and never starts this one.  Kept for reference only.
++service p2p_supplicant /vendor/bin/hw/wpa_supplicant \
+     -iwlan0 -Dnl80211 -c/data/misc/wifi/wpa_supplicant.conf \
+     -I/system/etc/wifi/wpa_supplicant_overlay.conf -N \
+     -ip2p0 -Dnl80211 -c/data/misc/wifi/p2p_supplicant.conf \
+@@ -578,3 +666,127 @@ service iprenew_bt-pan /system/bin/dhcpcd -n
+ # Hack to speed up shutdown (thx PolishVodka)
+ on property:sys.shutdown.requested=*
+     stop ril-daemon
++
++# --- sirsch: boot evidence and the way back in --------------------------------
++# These markers land in /cache, which survives a reset and can be read from
++# recovery, so a boot that never finishes can be told apart from one that
++# finished without a network.
++# The serial console starts in "on post-fs", earlier than everything else here.
++# /cache is mounted by then, the gadget has already been enabled in "on fs",
++# and it must not depend on post-fs-data: boots have been dying at and around
++# the mount chain, which is precisely where a console is worth having.
++# persist.sys.usb.config'i her boot'ta bilinen bir degere cek.  Framework onu
++# kendi istegine gore degistiriyor ve handler'i olmayan bir degerde birakirsa
++# telefon bir daha fonksiyonsuz gadget'la aciliyor - 25 Agustos'ta tam bu oldu
++# ("config 1 has no interfaces").  Kanal, onceki oturumun biraktigi bir
++# property'ye bagli olmamali.
++on early-init
++    setprop persist.sys.usb.config mtp,adb
++
++on early-init
++    # Pack mmap allocations bottom-up from TASK_UNMAPPED_BASE instead of
++    # alternating between the top-down walk and its bottom-up fallback.  The
++    # alternation is what scattered zygote's ~1300 mappings over 2 GB with no
++    # hole bigger than 19.5 MB; packed, the same mappings leave the rest of the
++    # address space in one piece.  Paired with the lowered TASK_UNMAPPED_BASE
++    # in arch/arm/include/asm/memory.h.
++    write /proc/sys/vm/legacy_va_layout 1
++
++    # Charging, set through sysfs rather than the kernel command line: this
++    # bootloader forwards only some of the boot image's cmdline keys, so
++    # abb_charger.* never reached the kernel and the fix sat inactive for a
++    # day.  zayif_vbus keeps the charge running when the AB8500 calls this
++    # connector's VBUS out of spec; giris_akimi lifts the input ceiling above
++    # the 500 mA a PC port advertises, and is applied the moment it is written.
++    # The AB8500's own VBUS-drop back-off still runs, so the port is never
++    # asked for more than it can hold.
++    write /sys/module/abb_charger/parameters/zayif_vbus 1
++    write /sys/module/abb_charger/parameters/giris_akimi 900
++
++on post-fs
++    write /cache/sirsch-boot-0-post-fs 1
++    start sirsch_konsol
++    # Shield mode.  It runs here, before class_start ever reaches the
++    # framework, because stopping a service also marks it disabled and a later
++    # class_start then skips it - trying to kill a crash loop after it has
++    # started is a race this handset loses.
++    start sirsch_kalkan
++
++    # Cap the CPU while booting.  db8500_freq_table on this SoC is
++    # 200/400/800/1000 MHz (arch/arm/mach-ux500/devices-db8500.c:620) and the
++    # top step also runs at the highest voltage, so two cores at 1 GHz during
++    # dex2oat is the worst current draw the handset ever produces.  That
++    # matters here because charging is already marginal: ab8500-charger keeps
++    # raising F_USB_CHARGER_NOT_OK and backing its input current down from
++    # 600 mA to 500 mA because VBUS sags to 4616 mV.  Peak draw is what causes
++    # that sag, and boots have been dying part-way with a weak battery.
++    # 800 MHz makes dex2oat slower and the boot far more likely to finish.
++    # Lifted again on sys.boot_completed below.
++    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 800000
++    write /sys/devices/system/cpu/cpu1/cpufreq/scaling_max_freq 800000
++
++# FunctionFS mount point.  The kernel now carries an ffs function in
++# drivers/usb/gadget/android.c, which is the only thing Android 8+ adbd can
++# speak over USB - without it the gadget advertises an adb interface
++# (class ff/42/01) that nothing answers and the host says "offline" forever.
++#
++# Deliberately NOT switched on here.  Routing "adb" to ffs means the gadget
++# stays disconnected until adbd has opened ep0 and handed the kernel its
++# descriptors; if adbd cannot do that, the handset presents NO usb device at
++# all - which would also take away /dev/ttyGS0 and the serial console, the one
++# channel that currently works.  So the mount is prepared and the alias is left
++# empty, which keeps "adb" bound to the old in-kernel f_adb exactly as before.
++#
++# To turn it on at runtime (reversible with a reboot):
++#   echo adb > /sys/class/android_usb/android0/f_ffs/aliases
++#   echo 0 > /sys/class/android_usb/android0/enable
++#   echo mtp,acm,adb > /sys/class/android_usb/android0/functions
++#   echo 1 > /sys/class/android_usb/android0/enable
++    mkdir /dev/usb-ffs 0770 shell shell
++    mkdir /dev/usb-ffs/adb 0770 shell shell
++    mount functionfs adb /dev/usb-ffs/adb uid=2000,gid=2000
++
++on post-fs-data
++    write /cache/sirsch-boot-1-post-fs-data 1
++    start sirsch_izle
++    start sirsch_ag
++
++on boot
++    write /cache/sirsch-boot-2-boot 1
++
++on property:sys.boot_completed=1
++    write /cache/sirsch-boot-3-completed 1
++    start adbd
++    # Boot is over, give the cores their top step back.
++    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 1000000
++    write /sys/devices/system/cpu/cpu1/cpufreq/scaling_max_freq 1000000
++
++# Not oneshot: if the host closes /dev/ttyACM0 the shell exits, and the console
++# has to come back on its own.
++service sirsch_konsol /system/bin/sh /system/bin/sirsch-konsol.sh
++    class core
++    user root
++    group root log
++    disabled
++
++# The way back that does not need a person on the key combo.  Never oneshot
++# and never disabled-after-exit: if it dies the handset loses its only channel.
++service sirsch_kalkan /system/bin/sh /system/bin/sirsch-kalkan.sh
++    class core
++    user root
++    group root log inet net_admin net_raw
++    disabled
++
++service sirsch_izle /system/bin/sh /system/bin/sirsch-izle.sh
++    class core
++    user root
++    group root log
++    oneshot
++    disabled
++
++service sirsch_ag /system/bin/sh /system/bin/sirsch-ag.sh
++    class core
++    user root
++    group root inet net_admin net_raw wifi
++    oneshot
++    disabled
+diff --git a/rootdir/init.samsunggolden.usb.rc b/rootdir/init.samsunggolden.usb.rc
+index c62f92b..a32d73b 100644
+--- a/rootdir/init.samsunggolden.usb.rc
++++ b/rootdir/init.samsunggolden.usb.rc
+@@ -46,7 +46,10 @@ on property:sys.usb.config=mtp,adb
+     write /sys/class/android_usb/android0/idVendor 04E8
+     write /sys/class/android_usb/android0/idProduct 6860
+     write /sys/class/android_usb/android0/f_acm/instances 1
+-    write /sys/class/android_usb/android0/functions mtp,acm,adb
++    # See init.samsunggolden.rc "on fs": rndis replaces mtp, because MTP cannot
++    # work without FunctionFS on this kernel and rndis gives a working network
++    # with no userspace at all.
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
+     write /sys/class/android_usb/android0/enable 1
+     start adbd
+     setprop sys.usb.state $sys.usb.config
+@@ -232,3 +235,91 @@ on early-boot
+ #    write /sys/class/android_usb/android0/enable 1
+ #    write /sys/devices/platform/ab8500-i2c.0/ab8500-usb.0/boot_time_device 1
+ 
++
++# ---------------------------------------------------------------------------
++# 25 Agustos: telefon USB'de SIFIR arayuzle acildi.
++#   usb 1-3: config 1 has no interfaces?
++#   idVendor=04e8, idProduct=6860
++#
++# Sebep: framework ayaga kalkinca UsbDeviceManager sys.usb.config'i (ve
++# persist.sys.usb.config'i) "adb" yapmisti.  Bu dosyada TEK BASINA "adb" icin
++# handler yoktu - mtp, ptp, acm, rndis kombinasyonlari var, "adb" yok.  Eslesen
++# handler olmayinca android0/functions'a hicbir sey yazilmadi ve gadget
++# fonksiyonsuz enumerate oldu: ne konsol, ne adb, ne rndis.  Telefon calisiyordu
++# ama hicbir kanaldan ulasilamiyordu.
++#
++# Asagidaki handler'lar framework'un secebilecegi geri kalan degerleri de
++# kapsiyor ve hepsi ayni yere cikiyor: rndis,acm,adb.  Bu cihazda MTP zaten
++# FunctionFS olmadan calismiyor; rndis calisan bir ag, acm de calisan bir konsol
++# veriyor.  Kanal, framework'un ne istedigine bagli olmamali.
++# ---------------------------------------------------------------------------
++
++on property:sys.usb.config=adb
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
++    write /sys/class/android_usb/android0/enable 1
++    start adbd
++    setprop sys.usb.state $sys.usb.config
++
++on property:sys.usb.config=charging
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
++    write /sys/class/android_usb/android0/enable 1
++    start adbd
++    setprop sys.usb.state $sys.usb.config
++
++on property:sys.usb.config=charging,adb
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
++    write /sys/class/android_usb/android0/enable 1
++    start adbd
++    setprop sys.usb.state $sys.usb.config
++
++on property:sys.usb.config=midi
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
++    write /sys/class/android_usb/android0/enable 1
++    start adbd
++    setprop sys.usb.state $sys.usb.config
++
++on property:sys.usb.config=midi,adb
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
++    write /sys/class/android_usb/android0/enable 1
++    start adbd
++    setprop sys.usb.state $sys.usb.config
++
++on property:sys.usb.config=accessory
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
++    write /sys/class/android_usb/android0/enable 1
++    start adbd
++    setprop sys.usb.state $sys.usb.config
++
++on property:sys.usb.config=accessory,adb
++    write /sys/class/android_usb/android0/enable 0
++    write /sys/class/android_usb/android0/idVendor 04E8
++    write /sys/class/android_usb/android0/idProduct 6860
++    write /sys/class/android_usb/android0/f_acm/instances 1
++    write /sys/class/android_usb/android0/functions rndis,acm,adb
++    write /sys/class/android_usb/android0/enable 1
++    start adbd
++    setprop sys.usb.state $sys.usb.config
