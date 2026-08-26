@@ -39,6 +39,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <stdlib.h>
 
 #define PORT_VARSAYILAN 8088
 #define TAMPON 65536
@@ -390,6 +391,81 @@ static void gecmis_ver(int s) {
     gonder(s, "200 OK", "text/plain; charset=utf-8", buf, n);
 }
 
+
+/* ------------------------------------------------------------- surecler
+ *
+ * 26 Agustos: telefon 70 dakika boyunca yuk 3.0'da takildi kaldi ve NE oldugunu
+ * ogrenmenin hicbir yolu yoktu - `adb shell` ve seri konsol ikisi de fork
+ * gerektirdigi icin doymus bir makinede cevap vermiyor, oysa nod (fork
+ * etmeyen, tek dongulu) anında cevapliyordu.  "Yuk 3.0" bilgisi tek basina
+ * bir sey soylemiyor; hangi surecin yedigini soylemesi lazim.
+ *
+ * Bu uc, /proc'u dogrudan okuyup en cok CPU yiyen surecleri veriyor.  Hicbir
+ * sey fork etmiyor, hicbir sey ayirmiyor - yani tam da fork'un calismadigi
+ * durumda calisiyor, ki zaten o durum icin var.
+ */
+typedef struct { int pid; unsigned long jif; char ad[64]; char durum; } Surec;
+
+static int surec_kar(const void *a, const void *b) {
+    unsigned long x = ((const Surec *)a)->jif, y = ((const Surec *)b)->jif;
+    return x < y ? 1 : (x > y ? -1 : 0);
+}
+
+static void surecler_ver(int s) {
+    static char buf[TAMPON];
+    static Surec liste[512];
+    int n = 0;
+    DIR *d = opendir("/proc");
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) && n < 512) {
+            if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+            char yol[512], b[1024];
+            snprintf(yol, sizeof yol, "/proc/%s/stat", e->d_name);
+            if (oku(yol, b, sizeof b) <= 0) continue;
+            /* comm alani parantez icinde ve bosluk icerebilir; sondan ara */
+            char *ac = strchr(b, '('), *kap = strrchr(b, ')');
+            if (!ac || !kap || kap < ac) continue;
+            size_t adn = (size_t)(kap - ac - 1);
+            if (adn > sizeof liste[0].ad - 1) adn = sizeof liste[0].ad - 1;
+            memcpy(liste[n].ad, ac + 1, adn); liste[n].ad[adn] = 0;
+            /* kap+2'den itibaren: durum, ppid, ... utime(14) stime(15) */
+            char *p = kap + 2;
+            liste[n].durum = *p;
+            unsigned long alan[20]; int k = 0;
+            char *kayit = p;
+            while (k < 20 && (kayit = strchr(kayit, ' '))) {
+                kayit++;
+                alan[k++] = strtoul(kayit, NULL, 10);
+            }
+            /* alan[0] = ppid ... utime = alan[11], stime = alan[12] */
+            liste[n].jif = (k > 12) ? alan[11] + alan[12] : 0;
+            liste[n].pid = atoi(e->d_name);
+            n++;
+        }
+        closedir(d);
+    }
+    qsort(liste, (size_t)n, sizeof liste[0], surec_kar);
+
+    Yazi y = {buf, 0, sizeof buf};
+    char b[256];
+    if (oku("/proc/uptime", b, sizeof b) > 0) ekle(&y, "# uptime %s\n", b);
+    if (oku("/proc/loadavg", b, sizeof b) > 0) ekle(&y, "# yuk %s\n", b);
+    ekle(&y, "# en cok cpu yiyen 25 surec (jiffy = utime+stime, boot'tan beri)\n");
+    ekle(&y, "%-7s %-3s %12s  %s\n", "PID", "D", "JIFFY", "AD");
+    for (int i = 0; i < n && i < 25; i++)
+        ekle(&y, "%-7d %-3c %12lu  %s\n", liste[i].pid, liste[i].durum,
+             liste[i].jif, liste[i].ad);
+    /* D durumundakiler ayri: bunlar CPU yemiyor, I/O'da bloke - "yuk yuksek
+     * ama islemci bos" durumunun tek isareti bu. */
+    ekle(&y, "\n# D (kesintisiz I/O beklemesi) durumundakiler:\n");
+    int dd = 0;
+    for (int i = 0; i < n; i++)
+        if (liste[i].durum == 'D') { ekle(&y, "  %d %s\n", liste[i].pid, liste[i].ad); dd++; }
+    if (!dd) ekle(&y, "  yok\n");
+    gonder(s, "200 OK", "text/plain; charset=utf-8", buf, y.n);
+}
+
 /* ------------------------------------------------------------------- http */
 
 static void gonder(int s, const char *durum, const char *tur, const char *govde, size_t n) {
@@ -522,6 +598,7 @@ static const char *KOK_SAYFA =
     "\n"
     "  /durum    JSON: uptime, pil (uc kaynak ayri ayri), cpu, isi, ag\n"
     "  /gecmis   son 24 saatin ornekleri (10 sn arayla, halka tampon)\n"
+    "  /surecler en cok cpu yiyen surecler + D durumundakiler (fork etmez)\n"
     "  /olcum    son olcum raporu\n"
     "  /kmesg    cekirdek halka tamponu (son 64 KB)\n"
     "  /wifi     wifi kurulum gunlugu\n"
@@ -590,6 +667,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(yol, "/durum"))     durum_ver(s);
         else if (!strcmp(yol, "/saglik"))    gonder(s, "200 OK", "text/plain", "ayakta\n", 7);
         else if (!strcmp(yol, "/gecmis"))    gecmis_ver(s);
+        else if (!strcmp(yol, "/surecler")) surecler_ver(s);
         else if (!strcmp(yol, "/olcum"))     dosya_ver(s, "/data/olcum/sonuc.txt", "text/plain; charset=utf-8");
         else if (!strcmp(yol, "/wifi"))      dosya_ver(s, "/data/olcum/wifi.log", "text/plain; charset=utf-8");
         else if (!strcmp(yol, "/kmesg"))     dosya_ver(s, "/proc/kmsg", "text/plain");
