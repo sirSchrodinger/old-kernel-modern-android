@@ -271,6 +271,125 @@ static void isi_json(Yazi *y) {
     ekle(y, "]");
 }
 
+
+/* gonder() asagida tanimli; halka kodu ondan once geliyor. */
+static void gonder(int s, const char *durum, const char *tur, const char *govde, size_t n);
+
+/* --------------------------------------------------------------- gecmis
+ *
+ * A fixed-size ring of samples on disk, and the reason it is a ring and not a
+ * log: this node's whole point is that it keeps running through a power cut
+ * that takes the router with it.  During that cut nothing can collect from it,
+ * so the data has to survive locally - and on an 8 GB handset an unbounded log
+ * is a way to fill /data and lose the node instead.
+ *
+ * Pull, not push.  A pushing agent needs an outbound queue, retry logic and a
+ * clock to decide when to give up; a ring that holds a day of history needs
+ * none of that, because the collector simply catches up when the network comes
+ * back.  The queue IS the ring.
+ *
+ * Records are fixed-width ASCII.  Fixed-width so the ring can be written in
+ * place with one pwrite and no locking; ASCII so that when something has gone
+ * wrong the file can be read with `tail` on a handset that may not have much
+ * else working.
+ */
+#define KAYIT_BOYU 128
+#define KAYIT_ADEDI 8640          /* 10 s araliklarla 24 saat */
+#define GECMIS_YOL "/data/sirsch/gecmis.ring"
+#define ORNEK_ARALIK 10
+
+static char gecmis_yol[256] = GECMIS_YOL;
+
+/* Header lives in record slot 0 and holds nothing but the next write index,
+ * so a torn write can lose one sample and never the file. */
+static long gecmis_indis(int fd) {
+    char b[KAYIT_BOYU + 1];
+    if (pread(fd, b, KAYIT_BOYU, 0) != KAYIT_BOYU) return 0;
+    b[KAYIT_BOYU] = 0;
+    long v = strtol(b, NULL, 10);
+    return (v < 0 || v >= KAYIT_ADEDI) ? 0 : v;
+}
+
+static void gecmis_yaz(void) {
+    int fd = open(gecmis_yol, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) return;
+
+    /* First run: lay the whole ring down as blanks so every later write is an
+     * in-place overwrite and the file never grows. */
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size < (off_t)((KAYIT_ADEDI + 1) * KAYIT_BOYU)) {
+        char bos[KAYIT_BOYU];
+        memset(bos, ' ', KAYIT_BOYU); bos[KAYIT_BOYU - 1] = '\n';
+        for (long i = 0; i <= KAYIT_ADEDI; i++)
+            if (pwrite(fd, bos, KAYIT_BOYU, i * KAYIT_BOYU) != KAYIT_BOYU) { close(fd); return; }
+    }
+
+    long uv = oku_uzun(PS "/battery/voltage_now", -1);
+    int mv = uv > 100000 ? (int)(uv / 1000) : (int)uv;
+    char yuk[64] = "-";
+    oku("/proc/loadavg", yuk, sizeof yuk);
+    char *bosluk = strchr(yuk, ' '); if (bosluk) *bosluk = 0;
+    char up[64] = "0";
+    oku("/proc/uptime", up, sizeof up);
+    bosluk = strchr(up, ' '); if (bosluk) *bosluk = 0;
+    struct sysinfo si; si.freeram = 0; si.mem_unit = 1;
+    sysinfo(&si);
+
+    char kayit[KAYIT_BOYU + 1];
+    int k = snprintf(kayit, sizeof kayit,
+        "%ld %s %d %ld %ld %ld %ld %ld %s %lu %s",
+        (long)time(NULL), up, mv,
+        oku_uzun(PS "/battery/current_now", 0),
+        oku_uzun(PS "/battery/capacity", -1),
+        oku_uzun(PS "/battery/temp", -9999),
+        oku_uzun("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", -1),
+        oku_uzun("/sys/devices/system/cpu/cpu1/cpufreq/scaling_cur_freq", -1),
+        yuk, (unsigned long)(si.freeram / 1024 * si.mem_unit),
+        access("/sys/class/net/wlan0/operstate", R_OK) == 0 ? "wlan" : "-");
+    if (k < 0) { close(fd); return; }
+    if (k > KAYIT_BOYU - 1) k = KAYIT_BOYU - 1;
+    memset(kayit + k, ' ', KAYIT_BOYU - k);
+    kayit[KAYIT_BOYU - 1] = '\n';
+
+    long i = gecmis_indis(fd);
+    /* Sample first, index second.  Crash between the two and the collector
+     * re-reads one old record; the other order would hand it a blank. */
+    if (pwrite(fd, kayit, KAYIT_BOYU, (i + 1) * KAYIT_BOYU) == KAYIT_BOYU) {
+        char h[KAYIT_BOYU];
+        memset(h, ' ', KAYIT_BOYU); h[KAYIT_BOYU - 1] = '\n';
+        snprintf(h, sizeof h, "%ld", (i + 1) % KAYIT_ADEDI);
+        h[strlen(h)] = ' ';
+        h[KAYIT_BOYU - 1] = '\n';
+        if (pwrite(fd, h, KAYIT_BOYU, 0) != KAYIT_BOYU) { /* bir ornek kaybi, dosya saglam */ }
+    }
+    close(fd);
+}
+
+/* Oldest first, so a collector can just append what it has not seen. */
+static void gecmis_ver(int s) {
+    int fd = open(gecmis_yol, O_RDONLY);
+    if (fd < 0) { gonder(s, "404 Not Found", "text/plain", "gecmis yok\n", 11); return; }
+    static char buf[KAYIT_ADEDI * 40 + 512];
+    size_t n = 0;
+    const char *b = "# epoch uptime mv akim yuzde tempC10 khz0 khz1 yuk1 mem_kb ag\n";
+    n += snprintf(buf + n, sizeof buf - n, "%s", b);
+    long i = gecmis_indis(fd);
+    char kayit[KAYIT_BOYU + 1];
+    for (long adim = 0; adim < KAYIT_ADEDI && n < sizeof buf - KAYIT_BOYU - 2; adim++) {
+        long slot = ((i + adim) % KAYIT_ADEDI) + 1;
+        if (pread(fd, kayit, KAYIT_BOYU, slot * KAYIT_BOYU) != KAYIT_BOYU) break;
+        kayit[KAYIT_BOYU] = 0;
+        if (kayit[0] == ' ') continue;                 /* henuz yazilmamis */
+        char *son = kayit + KAYIT_BOYU - 1;
+        while (son > kayit && (*son == ' ' || *son == '\n')) son--;
+        size_t uzun = (size_t)(son - kayit + 1);
+        memcpy(buf + n, kayit, uzun); n += uzun;
+        buf[n++] = '\n';
+    }
+    close(fd);
+    gonder(s, "200 OK", "text/plain; charset=utf-8", buf, n);
+}
+
 /* ------------------------------------------------------------------- http */
 
 static void gonder(int s, const char *durum, const char *tur, const char *govde, size_t n) {
@@ -319,6 +438,7 @@ static const char *KOK_SAYFA =
     "golden nod\n"
     "\n"
     "  /durum    JSON: uptime, pil (uc kaynak ayri ayri), cpu, isi, ag\n"
+    "  /gecmis   son 24 saatin ornekleri (10 sn arayla, halka tampon)\n"
     "  /olcum    son olcum raporu\n"
     "  /kmesg    cekirdek halka tamponu (son 64 KB)\n"
     "  /wifi     wifi kurulum gunlugu\n"
@@ -343,7 +463,26 @@ int main(int argc, char **argv) {
     if (bind(d, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); return 1; }
     if (listen(d, 8) < 0) { perror("listen"); return 1; }
 
+    /* Testte halka baska bir yere yazilabilsin: cihazda /data/sirsch dogru
+     * yer ama qemu altinda dogrulama yapmanin tek yolu bu. */
+    const char *ozel = getenv("GOLDEN_GECMIS");
+    if (ozel && *ozel) snprintf(gecmis_yol, sizeof gecmis_yol, "%s", ozel);
+    mkdir("/data/sirsch", 0755);
+    time_t son_ornek = 0;
+
     for (;;) {
+        /* One thread, no forking.  The sampler shares the accept loop through
+         * select's timeout: on a two-core handset a status endpoint that
+         * spawns under load is a way to lose the node, and the sampling
+         * interval is 10 s - there is no contention to design around. */
+        fd_set r;
+        FD_ZERO(&r); FD_SET(d, &r);
+        struct timeval bekle = {1, 0};
+        int hazir = select(d + 1, &r, NULL, NULL, &bekle);
+        time_t simdi_sn = time(NULL);
+        if (simdi_sn - son_ornek >= ORNEK_ARALIK) { gecmis_yaz(); son_ornek = simdi_sn; }
+        if (hazir <= 0) continue;
+
         int s = accept(d, NULL, NULL);
         if (s < 0) { if (errno == EINTR) continue; break; }
         /* One request per connection, served inline.  There is no concurrency
@@ -365,6 +504,7 @@ int main(int argc, char **argv) {
         if (!strcmp(yol, "/") )              gonder(s, "200 OK", "text/plain; charset=utf-8", KOK_SAYFA, strlen(KOK_SAYFA));
         else if (!strcmp(yol, "/durum"))     durum_ver(s);
         else if (!strcmp(yol, "/saglik"))    gonder(s, "200 OK", "text/plain", "ayakta\n", 7);
+        else if (!strcmp(yol, "/gecmis"))    gecmis_ver(s);
         else if (!strcmp(yol, "/olcum"))     dosya_ver(s, "/data/olcum/sonuc.txt", "text/plain; charset=utf-8");
         else if (!strcmp(yol, "/wifi"))      dosya_ver(s, "/data/olcum/wifi.log", "text/plain; charset=utf-8");
         else if (!strcmp(yol, "/kmesg"))     dosya_ver(s, "/proc/kmsg", "text/plain");
