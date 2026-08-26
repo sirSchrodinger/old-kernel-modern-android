@@ -247,6 +247,34 @@ More than one `type=Battery`, or a `temp` that is not roughly ten times a
 plausible °C, and you have this bug.
 
 
+## A debug mode must not disable the network
+
+Not a kernel bug, a design mistake, and the one that cost the most hours.
+
+This ROM has a "shield mode": no SurfaceFlinger, no zygote, no framework -
+just a serial console, USB ethernet and adbd over TCP. It exists so that a
+handset whose framework is crash-looping is still a machine you can work on.
+Good idea. But the script that entered it also stopped the service that brings
+up WiFi without the framework, on the reasoning that shield mode "owns the
+handset".
+
+That reasoning is wrong, and the cost was measured rather than argued. When the
+handset later wedged in shield mode, exactly one channel was left: rndis at the
+end of the USB cable. Had the cable been out, or had it been plugged into a
+wall charger instead of the host, the device would have been completely
+unreachable with no way back except the power button.
+
+Shield mode stops the *framework*. It has no business stopping the *network*. A
+node's network is more fundamental than anything running on top of it: you can
+always kill the software over a working link, and you can never fix a link over
+dead software.
+
+The rule that came out of it: **whatever your degraded/rescue mode turns off,
+it must leave at least two independent ways in, and it must never reduce that
+number to one.** Serial plus USB-ethernet is one physical cable - that is one
+channel wearing two hats.
+
+
 ## Layout
 
 ```
