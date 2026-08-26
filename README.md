@@ -295,6 +295,35 @@ than one cycle - the first version silently read 0.00 ns at every size because
 the compiler kept the pointer chase in registers, and a physically impossible
 number is not a small error, it is the measurement not happening.
 
+`tools/goz.cpp` is the detector that makes the handset useful rather than
+merely alive: it runs yolo-fastestv2 int8 through ncnn and prints JSON. It is a
+file processor, not a video pipeline, and that is a measurement-driven choice -
+one core on this SoC already saturates the memory bus, so continuous streaming
+is the wrong shape of work, while ~5 fps detection on a device with its own
+battery is exactly right for producing events.
+
+It also carries a lesson worth more than the tool. The exported network's
+output is **not raw logits**: measured on a blank frame, `[0:12]` (box) lands
+in 0.299-0.691, `[12:15]` (objectness) is exactly 0.000, and `[15:95]` (class)
+is 0.001-0.148 - the activations were folded into the graph at export. The
+first version applied sigmoid and tanh on top of that. It *looked* like it
+worked: on a real COCO frame of two bowls of broccoli it correctly said
+"broccoli" and "dining table". But every score clustered around 0.61, because
+`sigmoid(0) = 0.5` and `sqrt(0.5 x 0.75) = 0.61` - the objectness signal was
+gone and the "confidence" was a constant. A detector that finds the right class
+while inventing its confidence is more dangerous than one that is simply wrong,
+because it silently defeats anyone trying to set a threshold.
+
+The check that caught it was not looking at boxes but at the *distribution* of
+the numbers per index range, on a blank input where the answer is known: an
+objectness field that is exactly zero on an empty frame is telling you it has
+already been through a sigmoid.
+
+After the fix, fp32 and int8 agree closely on the same frames (0.693 vs 0.682
+on the top box, same coordinates), which is both the decode's confirmation and
+a useful result on its own: on this network int8 costs almost no accuracy and
+roughly halves the time.
+
 `tools/konsol-sor.py` drives the CDC-ACM serial console (`ttyGS0`↔`ttyACM0`),
 which is the channel that survives when `adbd` cannot. Note it holds the port
 open for the whole session — closing it hangs up the shell on the device side.
