@@ -1,0 +1,86 @@
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@ -964,45 +964,65 @@
+ 		goto changed;
+ 
+ 	case PR_CAP_AMBIENT:
++		/*
++		 * Every exit below must leave through changed/no_change/error,
++		 * because `new` was allocated at the top of this function.  The
++		 * PR_CAP_AMBIENT backport into this 3.4 tree returned directly
++		 * and called prepare_creds() a second time, so each of these
++		 * paths dropped a struct cred on the floor.
++		 */
+ 		if (arg2 == PR_CAP_AMBIENT_CLEAR_ALL) {
+-			if (arg3 | arg4 | arg5)
+-				return -EINVAL;
++			if (arg3 | arg4 | arg5) {
++				error = -EINVAL;
++				goto error;
++			}
+ 
+-			new = prepare_creds();
+-			if (!new)
+-				return -ENOMEM;
+ 			cap_clear(new->cap_ambient);
+-			return commit_creds(new);
++			goto changed;
+ 		}
+ 
+-		if (((!cap_valid(arg3)) | arg4 | arg5))
+-			return -EINVAL;
++		if (((!cap_valid(arg3)) | arg4 | arg5)) {
++			error = -EINVAL;
++			goto error;
++		}
+ 
+ 		if (arg2 == PR_CAP_AMBIENT_IS_SET) {
+-			return !!cap_raised(current_cred()->cap_ambient, arg3);
++			error = !!cap_raised(current_cred()->cap_ambient, arg3);
++			goto no_change;
+ 		} else if (arg2 != PR_CAP_AMBIENT_RAISE &&
+ 			   arg2 != PR_CAP_AMBIENT_LOWER) {
+-			return -EINVAL;
++			error = -EINVAL;
++			goto error;
+ 		} else {
+ 			if (arg2 == PR_CAP_AMBIENT_RAISE &&
+ 			    (!cap_raised(current_cred()->cap_permitted, arg3) ||
+ 			     !cap_raised(current_cred()->cap_inheritable,
+-					 arg3)))
+-				return -EPERM;
++					 arg3))) {
++				error = -EPERM;
++				goto error;
++			}
+ 
+-			new = prepare_creds();
+-			if (!new)
+-				return -ENOMEM;
+ 			if (arg2 == PR_CAP_AMBIENT_RAISE)
+ 				cap_raise(new->cap_ambient, arg3);
+ 			else
+ 				cap_lower(new->cap_ambient, arg3);
+-			return commit_creds(new);
++			goto changed;
+ 		}
+ 
+ 	default:
+-		/* No functionality available - continue with default */
+-		return -ENOSYS;
++		/*
++		 * The hot path.  sys_prctl() calls security_task_prctl() before
++		 * its own switch, for EVERY option, so every prctl() that is not
++		 * a capability option lands here.  Android's linker issues
++		 * PR_SET_VMA_ANON_NAME for each anonymous mapping it makes, which
++		 * is ~75 prctl() calls per process start; returning without
++		 * abort_creds() leaked one struct cred plus its SELinux blob each
++		 * time.  Measured on this handset: 391 creds/s, 159 MB in
++		 * cred_jar and 83 MB in size-32 after 33 minutes of uptime, with
++		 * kswapd0 burning 18% of a core to reclaim against it.
++		 */
++		error = -ENOSYS;
++		goto error;
+ 	}
+ 
+ 	/* Functionality provided */

@@ -344,6 +344,117 @@ a method that something else can call, the message is a report about somebody
 else's decision.
 
 
+## A quarter of the RAM was kernel credentials
+
+Free memory on this handset sat at about 30 MB out of 825 for weeks. `kswapd0`
+never stopped, `mmcqd/0` tracked it, and the page cache could not grow past
+200 MB. On a 2012 phone running an OS from 2019 that is easy to file under
+"old device, not enough RAM" and move on.
+
+`/proc/slabinfo` said otherwise:
+
+```
+cred_jar   active=1276230  num=1276230  size=128  ->  159 MB
+size-32    active=1333518  num=1333518  size=64   ->   83 MB
+```
+
+Active equals num in both. Not one free slot, so these are not a cache that
+grew - they are live objects. And the count was still climbing: +7830 in 20
+seconds, **391 credentials a second**, about 180 MB an hour.
+
+### Bisection found the loudest caller, not the bug
+
+Stopping services one at a time pointed at a shell loop of ours: with it
+stopped the rate fell from 318/s to 15/s. But that loop forked only 7 times a
+second. Fifty-three credentials per fork is not a number any correct kernel
+produces, and a ratio that implausible is itself evidence that the diagnosis is
+sitting on the wrong layer.
+
+Measuring per *operation type* separated it:
+
+| operation | x200 | per operation |
+|---|---|---|
+| fork + execve | +16770 | **83.9** |
+| fork, no exec | +330 | 1.65 |
+| file read, no fork | +30 | 0.15 |
+
+The leak is in `execve`. Not SELinux auditing either - the same 200 execs
+produced exactly **2** avc lines.
+
+### One missing goto
+
+```c
+/* security/commoncap.c */
+int cap_task_prctl(int option, ...)
+{
+	struct cred *new;
+	long error = 0;
+
+	new = prepare_creds();      /* unconditional, for EVERY prctl */
+	...
+	default:
+		/* No functionality available - continue with default */
+		return -ENOSYS;     /* `new` is never freed */
+	}
+no_change:
+error:
+	abort_creds(new);
+	return error;
+}
+```
+
+Upstream writes `error = -ENOSYS; goto error;` there.
+
+What makes that default case hot is the dispatch order in `kernel/sys.c`:
+
+```c
+SYSCALL_DEFINE5(prctl, ...)
+{
+	error = security_task_prctl(option, arg2, arg3, arg4, arg5);
+	if (error != -ENOSYS)
+		return error;
+	error = 0;
+	switch (option) {
+	...
+```
+
+`security_task_prctl()` runs **first, for every option**, before prctl's own
+switch. So every `prctl()` that is not a capability option lands in that
+`default:` and leaks one `struct cred` plus the SELinux blob allocated beside
+it - which is what `size-32` was tracking, one for one.
+
+Then the multiplier: Android's linker issues `PR_SET_VMA_ANON_NAME` for **every
+anonymous mapping it makes**, to give the region a name. That is roughly 84
+prctl calls over a process start, so ~84 leaked credentials per exec. The
+arithmetic closes.
+
+The origin is a backport. This tree is 3.4.67; `PR_CAP_AMBIENT` is a 4.3
+feature that someone carried back into it, rewrote the tail of the function,
+and dropped the `goto`. Seven more leak paths were in the same block, and its
+success paths called `prepare_creds()` a second time, overwriting - and
+leaking - the one from the top of the function.
+
+### After
+
+| | before | after |
+|---|---|---|
+| `cred_jar` active | 1,668,420 | **990** |
+| leak rate | 391/s | **0/s** |
+| per exec | 84 | **0** |
+| Slab total | 244 MB | 38 MB |
+| Cached | 205 MB | 493 MB |
+| `kswapd0` ticks | 1999 | **0** |
+| STREAM Triad, 2 threads | 677 MB/s | 694 MB/s |
+
+`kswapd0` reaching zero is worth as much as the memory: it had been burning
+about 18% of one core reclaiming against a leak that could not be reclaimed.
+
+The patch is `patches/10-commoncap-cred-leak.patch`. Anyone running a modern
+Android userspace on a kernel old enough to need a `PR_CAP_AMBIENT` backport
+should check their own `cap_task_prctl()` before assuming their memory pressure
+is the hardware's fault - the symptom is generic, and `cred_jar` in
+`/proc/slabinfo` answers the question in one line.
+
 ## Layout
 
 ```
