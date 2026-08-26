@@ -24,6 +24,14 @@ symptom-to-cause mapping is the part that transfers.
 **There is no ROM image here, and there will not be one.** The images built from
 this tree contain a personal WiFi configuration. Build your own.
 
+Since the port finished, the project went one step further, and the second half
+of this README is about that step: **once Android 10 booted, the next
+measurement said Android itself was the problem.** With the framework stopped
+the same handset has 705 MB free instead of 30, 143 processes instead of 814,
+and load ~0 instead of ~4. So the framework was removed from the boot path and
+the parts that mattered - a screen, a network, a scheduler - were rewritten
+without it. `tools/headless/` is that stack.
+
 ---
 
 ## Why this exists
@@ -458,14 +466,180 @@ is the hardware's fault - the symptom is generic, and `cred_jar` in
 ## Layout
 
 ```
-patches/    one patch per AOSP/kernel repo, apply with `git apply` from that repo's root
-device/     files that are new rather than modified
-tools/      the host-side harness (see below)
-docs/       longer write-ups
+patches/         one patch per AOSP/kernel repo, apply with `git apply` from that repo's root
+device/          files that are new rather than modified
+tools/           the host-side harness (see below)
+tools/headless/  the on-device stack that replaces the framework
+docs/            longer write-ups
 ```
 
 Patch `07-kernel_samsung_golden.patch` is large mostly because of the V4L2
 replacement described above; the rest of it is the timerfd backport.
+
+## When the fix is to remove Android
+
+The port succeeded: Android 10 boots on a Linux 3.4 kernel. Then the next
+measurement made the success look different.
+
+| | framework running | framework stopped |
+|---|---|---|
+| free memory | 30-50 MB | **705 MB** |
+| processes | 814 | **143** |
+| load, idle | ~4 | **~0** |
+| CPU idle, 60 s | - | **88.8 %** |
+
+On a 825 MB handset, the framework is not a platform, it is the workload. And
+for a box that sits on a network and answers questions, none of what it
+provides is wanted: no launcher, no apps, no window manager, no input method.
+
+So `ro.sirsch.mod=bassiz` ("headless") became the default boot mode, and the
+four things actually needed were rewritten without a framework. All of them are
+in `tools/headless/`.
+
+### The screen
+
+`ekran.c` writes straight to `/dev/graphics/fb0`. Glyphs are baked into the
+binary; data comes from sysfs and from plain-text files. Android's own
+`charger` mode already proves this path works on this device.
+
+Three things this cost, and none of them produce an error:
+
+* **MCDE composites alpha.** A 32bpp pixel with alpha 0 is fully transparent.
+  Every write succeeds, every ioctl returns 0, and the panel stays black.
+* **There are three framebuffers** (`yres_virtual` 2400 / `yres` 800). Draw into
+  the one that is not visible, then `FBIOPAN_DISPLAY`. Calling `FBIOBLANK` per
+  frame is visible flicker - self-inflicted.
+* **The touchscreen needs one suspend->resume cycle.** `mxt224s` registers
+  `early_suspend` and only enables its IRQ from `mxt_resume()`, reachable only
+  through `late_resume` - which, with no framework, never happens. Touch is
+  silent forever until something drives that transition once. `unbind`/`bind`
+  does *not* work: unbind does not release the regulator and probe then fails
+  with `-12`.
+
+Screen power is over half this device's idle draw - 106 mA measured, panel on
+vs off - so the panel sleeps after 45 s and wakes on touch or key. The
+background is pure black because the panel is AMOLED: an unlit pixel draws
+nothing. 8.5 % of pixels are lit.
+
+### The network
+
+Two pieces, because the framework owned both.
+
+`agci.c` talks to `wpa_supplicant`'s control socket directly. After the
+`wificond` MAC fix (`patches/09`) the supplicant runs, but the framework still
+refuses to associate: Android will not auto-join a 2.4 GHz network below about
+-80 dBm, and that was the only AP in range. A server node's network should not
+depend on that policy in the first place.
+
+`dhcp.c` is a minimal DHCP client, because on this ROM the DHCP client lives
+*inside* the framework (IpClient / netd) and there is no `dhcpcd`, `udhcpc` or
+busybox applet on the image. The one thing that is easy to get wrong: it must
+use `AF_PACKET`. Servers unicast the OFFER to an address the interface does not
+have yet, and a raw `sendto()` on an address-less interface is silently
+swallowed - the call succeeds and the TX counter never moves.
+
+A rule learned expensively: **never `ip addr flush` the interface you are
+reachable over.** It drops the association too, and the way back with it. The
+device is now given a second, link-local address that is deliberately never
+removed, so a machine on the same L2 can reach it even when DHCP is dead.
+
+### The data path
+
+The panel does not know where its data comes from, and must not. Anything that
+drops a plain-text `.pnl` file into a directory gets drawn: an HTTP fetch, a
+serial-attached microcontroller, an rsync, the device's own sysfs.
+`tools/headless/panel-format.md` is the whole specification.
+
+The reason is not elegance. Data sources change; drawing code should not have to.
+
+### The scheduler
+
+`sirsch-isler.sh` is 100 lines and replaces cron, which would want a daemon, a
+notion of time, and a writable `/etc`. Each job reports one line of what it
+*did* - not "ok", which says nothing - and that line is shown under the job on
+the panel. Touching a job runs it immediately.
+
+Four things about this shell (mksh/toybox) cost an evening each, and all four
+failed silently:
+
+* **A command run inside `while read … done < file` eats the rest of that file
+  through stdin.** Four jobs became one, with no error anywhere. `</dev/null`.
+* **`${x%%|*}` returns empty.** The file was full, the screen was blank.
+* **`exec 9<>file` followed by `flock -n 9` gives "Bad file descriptor"** and
+  the script exits 0. Use `( flock -n 9 || exit; … ) 9>file`; toybox `flock`
+  takes a descriptor, not a path.
+* **A pattern that matches its own searcher.** `surec_var "sirsch-isler.sh"`
+  matched the command line of whatever was *looking* for it, so the supervisor
+  concluded it was already running. Same trap as `pgrep -f` counting itself and
+  `pkill -f` killing itself. The fix is not a better pattern: keep the mutual
+  exclusion in exactly one place, and let the process itself refuse a second
+  instance.
+
+### The one that hid all of them
+
+For an evening the supervisor kept "failing to start" things. It was not
+failing. It was **frozen**, and `ps` said it was running.
+
+```
+cat /proc/<pid>/wchan     ->  pipe_wait
+its child                 ->  tr \0          (State: R, forever)
+that tr's fd 0            ->  /proc/<other>/cmdline
+<other>                   ->  gone
+```
+
+The supervisor forked a `tr` per process to read `/proc/<pid>/cmdline`. One of
+those processes exited mid-read and the read never returned EOF; `$(…)` waited
+on that pipe and took the whole supervisor with it. Killing the `tr` un-froze it
+in the same second.
+
+Two fixes, both worth copying: read **`comm`** instead of `cmdline` (one line,
+no NULs, and a vanished process simply fails the read), and use the shell's own
+`read` instead of forking - which also removes 140 forks per call.
+
+**A supervisor that hangs is quieter than the thing it supervises dying.**
+Process up, log clean, nothing running.
+
+### What the device can and cannot do now
+
+Measured on the handset, not extrapolated:
+
+| | |
+|---|---|
+| detection, 352x352 int8, 1 thread | **270-297 ms** (~3.9 fps), same under load |
+| the same at 2 threads | 198 ms idle, **1200+ ms** if anything else is awake |
+| JPEG decode cost | not measurable: a 6 KB and a 373 KB frame take the same time |
+| STREAM Triad | 651 MB/s - one thread already saturates the bus |
+| free memory | 705 MB |
+| idle, 60 s | 88.8 % CPU idle, 132 forks/min |
+
+The thread number is the interesting one, and the first answer was wrong. Two
+threads are 1.3x faster **only if both cores are genuinely free**; the moment
+anything else runs, ncnn's barrier spins and the same work takes six times
+longer. On a node that runs background jobs, "both cores free" cannot be
+guaranteed, so the detector is pinned to one thread: slower at best, three times
+better at worst, and predictable. A number without its conditions is not a
+measurement.
+
+What it cannot do: track objects frame to frame, or find twenty players on a
+wide pitch - at 352x352 a 1280x720 field puts them under the model's resolution
+floor. It found one of twenty. That work belongs on a real machine.
+
+### Is there anything left on the table
+
+| hardware | state | evidence |
+|---|---|---|
+| 2 x Cortex-A9 1 GHz | used, at the memory wall | Triad 694 MB/s; +25 % clock buys +2.4 % bandwidth |
+| NEON | used | 100,158 NEON instructions in the binary |
+| fused-MAC (VFPv4) | not on this CPU; ncnn already skips it | all 233 `vfma` sites are in GRU/RNN kernels this model never enters |
+| hardware JPEG decoder | pointless | decode is not measurable, see above |
+| Mali-400 GPU | unused, and should stay unused | ES 2.0 only: no compute shaders, no OpenCL - and it shares the bus that is already saturated |
+| ux500 crypto engine | builds, still disabled | held back for a separate boot |
+| ARM assembly AES/SHA | used | `aes-asm` registered in `/proc/crypto` |
+| 13 i2c sensors | unused | accelerometer, light - small wins |
+| modem | left alone | killing it costs **+61 mA**, measured twice |
+
+Nothing meaningful is left on the compute side. That is worth stating plainly,
+because the instinct is always that there must be more.
 
 ## Tools
 
@@ -494,6 +668,17 @@ difference, and `olcer_guvenilir: false` when they disagree by more than 12
 points. On a device whose fuel gauge fabricates values that distinction is the
 whole point. No libraries, no interpreter, no framework - it answers while
 `zygote` is crash-looping, which is when you need it.
+
+`tools/headless/` is the on-device stack described above: `ekran.c` (framebuffer
+panel, ~1700 lines, no libraries beyond libc), `agci.c` (wpa_supplicant control
+socket), `dhcp.c` (minimal DHCP client), `font-uret.py` (bakes a monospace face
+into a C header), `panel-format.md` (the plain-text data format), and the shell
+layer: `sirsch-kalkan.sh` (supervisor), `sirsch-isler.sh` (scheduler),
+`sirsch-panel-uret.sh` (data), `sirsch-goz.sh` (detection), `sirsch-wifi.sh`,
+`sirsch-ag-adres.sh` (address and route).
+
+Comments inside `ekran.c`, `dhcp.c` and the shell scripts are in Turkish; the
+reasoning is summarised in English in the section above.
 
 `tools/stream.c` and `tools/gecikme.c` are the two memory measurements that
 explain why this SoC gains only ~1.27x from its second core: one thread already
