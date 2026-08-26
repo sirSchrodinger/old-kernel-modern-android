@@ -51,6 +51,7 @@ these. This is the list I wish I had found.
 | 9 | `SystemUI` SEGV loop at `0x30` | `EnhancedEstimatesImpl.getEstimate()` returns null and `PowerUI` dereferences it without checking | Fall back to the plain `BatteryStateSnapshot` |
 | 10 | WiFi enabled, `wlan0` DOWN, `wpa_supplicant` never starts, `/data/misc/wifi/` empty | **Two** independent causes, see below | see below |
 | 11 | Handset powers itself off ~50 s into **every** boot; `last_kmsg` shows `init: Received sys.powerctl='shutdown,thermal,battery' from pid: N (system_server)` while the battery sysfs reads 27 °C | `/sys/class/power_supply` has **three** nodes whose `type` is `Battery`. `BatteryMonitor::init()` walks them in readdir order and takes the first that answers per field, so which one wins is undefined. Here it took `sec-fuelgauge`, whose `temp` is not a temperature: `-1066830336` is `0xC0640000`, the raw IEEE-754 bits of `-3.5625`. When that garbage carried a positive sign the framework read tens of thousands of degrees and `BatteryService.shutdownIfOverTempLocked()` did its job | Board-specific `libhealthd.<device>` that names the bad nodes in `ignorePowerSupplyNames` **and** pins every `battery*Path` explicitly. Raising `config_shutdownBatteryTemperature` does **not** work - no threshold survives a float's bit pattern |
+| 12 | Handset still powers itself off ~50 s into every boot **after** the health HAL is fixed and `dumpsys battery` agrees with sysfs to the digit | `BatteryService` was still starting `ShutdownActivity`. Neither of its two conditions could be true (level 49, temperature 351 against a 3000 threshold verified with `aapt2 dump resources`), and `last_kmsg` could not say otherwise because SELinux-permissive audit spam had overwritten everything before the 50 s mark - and Android 10's `init` logs `Received sys.powerctl` to logd, not kmsg, once logd is up | Write logcat to a file under `/data`: init unmounts it *cleanly* during shutdown, so the file survives. The trigger was in it: `ActivityTaskManager: START u0 {act=…REQUEST_SHUTDOWN cmp=…ShutdownActivity} from uid 1000` followed by `ShutdownActivity: onCreate(): confirm=false` - `confirm=false` is `BatteryService.startShutdownActivity()`'s signature and nothing else in the tree sends that intent |
 
 ### 10, in detail — because this one is worth its own section
 
@@ -273,6 +274,43 @@ The rule that came out of it: **whatever your degraded/rescue mode turns off,
 it must leave at least two independent ways in, and it must never reduce that
 number to one.** Serial plus USB-ethernet is one physical cable - that is one
 channel wearing two hats.
+
+
+## When the log you need is the log that gets erased
+
+Three separate instruments lied about the same failure, and each lie looked
+like an answer.
+
+**`last_kmsg` looked empty of causes.** It was not empty - it started at the
+50 second mark, because SELinux in permissive mode logs *every* denial and this
+ROM produces thousands of them during boot. The ring buffer had wrapped and
+taken the interesting part with it. A log that begins in the middle looks like
+a log that has nothing in it.
+
+**`bootstat` named a reason that was already fixed.** `Canonical boot reason:
+shutdown,thermal,battery` kept appearing after the temperature path had been
+corrected and verified. On a device whose bootloader forwards no
+`androidboot.bootreason`, that string can be a persisted leftover rather than a
+statement about this boot.
+
+**`grep | head -20` hid the answer.** The matches were dominated by `Watchdog`
+and thermal-HAL noise near the top of a 6000-line file; every `ShutdownThread`
+line sat past line 4600. The command returned quickly, printed twenty plausible
+lines, and pointed the wrong way. `head` on a grep of an unfamiliar log is a
+way to be confidently wrong.
+
+What worked was writing `logcat` to a file on `/data` and reading it after the
+next boot. `init` unmounts `/data` cleanly on its way down - the unmount is
+right there in `last_kmsg` - so a file written there survives the very event
+you are trying to explain. It is the one buffer on this device that neither
+wraps nor is overwritten by the reboot.
+
+```sh
+# before the failure
+logcat -b main -b system -b crash -v time > /data/sirsch/son.log &
+# after the next boot
+grep -nE 'ShutdownThread|REQUEST_SHUTDOWN|Shutting down' /data/sirsch/son.log
+```
 
 
 ## Layout
