@@ -1,0 +1,9 @@
+cc_library_static {
+    name: "libhealthd.golden",
+    srcs: ["healthd_board_golden.cpp"],
+    vendor_available: true,
+    recovery_available: true,
+    cflags: ["-Werror"],
+    header_libs: ["libhealthd_headers"],
+    shared_libs: ["libutils", "libcutils"],
+}

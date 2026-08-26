@@ -50,6 +50,7 @@ these. This is the list I wish I had found.
 | 8 | `system_server`, `SystemUI` and `media.codec` all SEGV at `0x0` | No `CONFIG_ION` in the kernel, so `C2AllocatorIon`'s ctor returns before setting `mTraits`, and `setUsageMapper` then copies a `std::string` from null | Guard both call sites; `debug.stagefright.ccodec=0` |
 | 9 | `SystemUI` SEGV loop at `0x30` | `EnhancedEstimatesImpl.getEstimate()` returns null and `PowerUI` dereferences it without checking | Fall back to the plain `BatteryStateSnapshot` |
 | 10 | WiFi enabled, `wlan0` DOWN, `wpa_supplicant` never starts, `/data/misc/wifi/` empty | **Two** independent causes, see below | see below |
+| 11 | Handset powers itself off ~50 s into **every** boot; `last_kmsg` shows `init: Received sys.powerctl='shutdown,thermal,battery' from pid: N (system_server)` while the battery sysfs reads 27 °C | `/sys/class/power_supply` has **three** nodes whose `type` is `Battery`. `BatteryMonitor::init()` walks them in readdir order and takes the first that answers per field, so which one wins is undefined. Here it took `sec-fuelgauge`, whose `temp` is not a temperature: `-1066830336` is `0xC0640000`, the raw IEEE-754 bits of `-3.5625`. When that garbage carried a positive sign the framework read tens of thousands of degrees and `BatteryService.shutdownIfOverTempLocked()` did its job | Board-specific `libhealthd.<device>` that names the bad nodes in `ignorePowerSupplyNames` **and** pins every `battery*Path` explicitly. Raising `config_shutdownBatteryTemperature` does **not** work - no threshold survives a float's bit pattern |
 
 ### 10, in detail — because this one is worth its own section
 
@@ -146,6 +147,106 @@ with different values before you trust any of it.
 
 ---
 
+
+## The battery that lies
+
+Worth its own section, because the symptom points away from the cause and
+because the same shape shows up on a lot of Samsung boards of this era.
+
+The handset would boot, reach the launcher, and power off about fifty seconds
+later. Every time. Nothing in `logcat` said why - the framework shuts down
+*cleanly*, so there is no crash to find. The evidence only survives in
+`last_kmsg`:
+
+```
+init: Received sys.powerctl='shutdown,thermal,battery' from pid: 2296 (system_server)
+```
+
+`"thermal,battery"` is `PowerManager.SHUTDOWN_BATTERY_THERMAL_STATE`, which in
+Android 10 has exactly one producer worth checking:
+`BatteryService.shutdownIfOverTempLocked()`, firing when
+`mHealthInfo.batteryTemperature > config_shutdownBatteryTemperature` (default
+`680`, i.e. 68.0 °C).
+
+But the device's own sysfs said 27 °C. So the framework was not wrong - it was
+being lied to. Reading every power-supply node showed why:
+
+```
+/sys/class/power_supply/battery        type=Battery  capacity=45  voltage_now=3830000  temp=287
+/sys/class/power_supply/sec-charger    type=Battery  (no readable fields)
+/sys/class/power_supply/sec-fuelgauge  type=Battery  capacity=45  voltage_now=3835    temp=-1066830336
+```
+
+Three nodes claim to be the battery. `sec-fuelgauge` reports voltage in
+**millivolts** where the kernel ABI says microvolts, and its `temp` is a float
+printed through an integer formatter - `-1066830336` is `0xC0640000`, which as
+an IEEE-754 single is `-3.5625`. Whenever the underlying float was positive,
+the same bug produced a huge *positive* integer, and the framework read it as a
+temperature.
+
+`BatteryMonitor::init()` does not choose between them in any defined way:
+
+```cpp
+case ANDROID_POWER_SUPPLY_TYPE_BATTERY:
+    if (mHealthdConfig->batteryTemperaturePath.isEmpty()) {
+        path.appendFormat("%s/%s/temp", POWER_SUPPLY_SYSFS_PATH, name);
+        if (access(path, R_OK) == 0)
+            mHealthdConfig->batteryTemperaturePath = path;
+    }
+```
+
+First node that answers wins, and the walk order is whatever `readdir` returns.
+Per *field*, not per node - so the capacity can come from one and the
+temperature from another.
+
+The mechanism Android provides for this is `healthd_config::ignorePowerSupplyNames`,
+set from a board-specific `libhealthd.<device>`, selected by one line in
+`BoardConfig.mk`:
+
+```make
+BOARD_HAL_STATIC_LIBRARIES := libhealthd.golden
+``` `device/<vendor>/<device>/health/` in this repo has
+the whole file; the shape is:
+
+```cpp
+void healthd_board_init(struct healthd_config* config) {
+    config->ignorePowerSupplyNames.push_back(String8("sec-fuelgauge"));
+    config->ignorePowerSupplyNames.push_back(String8("sec-charger"));
+    config->batteryTemperaturePath = String8("/sys/class/power_supply/battery/temp");
+    /* ...and every other battery*Path, pinned */
+}
+```
+
+Both halves matter. `init()` only fills a path that is still empty, so pinning
+them makes the directory walk unable to override you even if the ignore list is
+ever bypassed.
+
+There is a third line of defence in `healthd_board_battery_update()`, which sees
+every poll before the framework does. It refuses values that are not physically
+possible - temperature outside -30…90 °C, cell voltage outside 2.5…4.6 V - and,
+because this gauge was separately observed jumping 46% → 28% → 29% inside one
+session, it refuses to believe a reported 0% while the cell voltage says
+otherwise. A gauge that can invent an 18-point drop can invent a zero, and
+`BatteryService.shouldShutdownLocked()` turns a zero into a shutdown.
+
+**Two things that do not work, so you can skip them:**
+
+- Raising `config_shutdownBatteryTemperature`. We tried `3000` (300 °C). The
+  bogus value was around 1.1 billion. No threshold survives a bit pattern.
+- Assuming the node named `battery` wins because it sorts first. `readdir` is
+  not sorted, and the code does not sort it.
+
+**How to check your own device in one line:**
+
+```sh
+for d in /sys/class/power_supply/*; do \
+  echo "$(basename $d) type=$(cat $d/type 2>/dev/null) temp=$(cat $d/temp 2>/dev/null)"; done
+```
+
+More than one `type=Battery`, or a `temp` that is not roughly ten times a
+plausible °C, and you have this bug.
+
+
 ## Layout
 
 ```
@@ -176,6 +277,23 @@ Two things it learned the hard way, both worth copying:
 * **Unreadable is not the same as different.** An early version treated a garbled
   console reply as a version mismatch and threw away a *working* boot. Only act
   on a positively identified answer.
+
+`tools/nod.c` is a ~40 KB static HTTP server that reports the handset's own
+state as JSON on port 8088 - uptime, CPU frequency and governor per core,
+thermal zones, network interfaces, and a battery block that never gives a
+single percentage. It gives what the gauge said, what the voltage implies, the
+difference, and `olcer_guvenilir: false` when they disagree by more than 12
+points. On a device whose fuel gauge fabricates values that distinction is the
+whole point. No libraries, no interpreter, no framework - it answers while
+`zygote` is crash-looping, which is when you need it.
+
+`tools/stream.c` and `tools/gecikme.c` are the two memory measurements that
+explain why this SoC gains only ~1.27x from its second core: one thread already
+saturates the bus (STREAM Triad 574 -> 661 MB/s from one thread to two, and
+Scale does not improve at all). `gecikme.c` refuses to print a latency smaller
+than one cycle - the first version silently read 0.00 ns at every size because
+the compiler kept the pointer chase in registers, and a physically impossible
+number is not a small error, it is the measurement not happening.
 
 `tools/konsol-sor.py` drives the CDC-ACM serial console (`ttyGS0`↔`ttyACM0`),
 which is the channel that survives when `adbd` cannot. Note it holds the port
