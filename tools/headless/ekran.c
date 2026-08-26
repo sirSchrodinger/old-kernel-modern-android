@@ -4,19 +4,19 @@
  * This device is not used as a phone but as a box that sits on a network and
  * does work.  For that job the Android framework is pure load: measured, with
  * zygote + system_server + surfaceflinger running, 30-50 MB of 825 MB stays
- * free and the device visibly stalls; with the framework stopped, 510 MB free
- * and load ~0.  (After the credential-leak kernel fix in patches/10, 705 MB.)
+ * free and the device visibly stalls; with the framework stopped, 705 MB free
+ * and load ~0.
  *
  * So whatever draws the screen cannot depend on the framework either.  This
  * program writes straight to the framebuffer - the same thing Android's own
  * `charger` mode does.  No surfaceflinger, no SurfaceView, no font engine:
- * the glyphs are baked into the binary (font.h), the data comes from sysfs.
+ * the glyphs are baked into the binary (font.h), the data comes from sysfs
+ * and from plain-text files.
  *
- * Three things this cost, worth knowing before you write your own:
+ * Four things this cost, none of which produce an error:
  *
  *   MCDE composites alpha.  A 32bpp pixel with alpha 0 is fully transparent:
  *   the write succeeds, every ioctl returns 0, and the panel shows nothing.
- *   Set the alpha bits.
  *
  *   There are three framebuffers (yres_virtual 2400 / yres 800).  Draw into
  *   the one that is not visible, then FBIOPAN_DISPLAY.  Never FBIOBLANK per
@@ -25,17 +25,22 @@
  *   The touchscreen (mxt224s) registers early_suspend and only enables its
  *   IRQ from mxt_resume(), reachable only via late_resume.  With no framework
  *   that transition never happens and touch stays silent forever.  One
- *   suspend->resume cycle fixes it; unbind/bind does not (unbind does not
- *   release the regulator and probe then fails -12).
+ *   suspend->resume cycle fixes it; unbind/bind does not.
+ *
+ *   The single-instance lock must be O_CLOEXEC.  This program forks for
+ *   scans and jobs, children inherit open descriptors, and one child that
+ *   wedges in an uninterruptible kernel path holds that lock forever - the
+ *   panel then never starts again and nothing says why.  A lock that leaks
+ *   into your own children is not a lock.
  *
  * Build: arm-linux-gnueabihf-gcc -O2 -static -o ekran ekran.c
  * Use:   ekran [-d /dev/graphics/fb0] [-s seconds] [-1] [-o out.ppm]
  *              [-p page] [-k source] [-t]
  *
- * -o is the important one: a wrong status screen is silently wrong - font,
- * layout and non-ASCII glyphs break without any error - so the output has to
- * be inspectable without going to the device.  -p/-k pick the page and data
- * source, and they work against live data without disturbing a running panel.
+ * -o matters: a wrong status screen is silently wrong - font, layout and
+ * non-ASCII glyphs break without any error - so the output has to be
+ * inspectable without going to the device.  -p/-k pick page and data source
+ * and work against live data without disturbing a running panel.
  *
  * NOTE: the inline commentary below is in Turkish.  The design rationale is
  * summarised in English in the repository README.
@@ -1612,8 +1617,21 @@ static void saat_dilimi(void)
 static int tek_ornek(void)
 {
     static const char *yol = "/data/sirsch/ekran.kilit";
-    int f = open(yol, O_RDWR | O_CREAT, 0600);
+    int f = open(yol, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
     if (f < 0) return 1;                 /* kilit kurulamadi: engelleme */
+    /* O_CLOEXEC SART.
+     *
+     * 27 Agustos: panel oldu ve bir daha acilmadi.  Sebep: `ekran` ag/bt
+     * taramasi ve is kosturmak icin fork+exec yapiyor, ve cocuk ACIK
+     * TANITICILARI devraliyor - bu kilit dahil.  bt taramasi cekirdekte
+     * `sysfs_addrm_finish` uzerinde kesintisiz (D) duruma dustu, SIGKILL bile
+     * onu almadi, ve o surec kilidi tutmaya devam ettigi surece `ekran`
+     * "zaten calisiyor" deyip hic baslamadi.
+     *
+     * Yani panelin kendi kilidi, panelin catalladigi herhangi bir cocuk
+     * takildiginda paneli KALICI olarak disari kilitliyordu.  CLOEXEC bu
+     * zinciri kokunden kesiyor: cocuk tanitici gormuyor.
+     */
     if (flock(f, LOCK_EX | LOCK_NB) < 0) {
         fprintf(stderr, "ekran zaten calisiyor\n");
         close(f);

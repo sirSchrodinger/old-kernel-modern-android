@@ -599,6 +599,35 @@ no NULs, and a vanished process simply fails the read), and use the shell's own
 **A supervisor that hangs is quieter than the thing it supervises dying.**
 Process up, log clean, nothing running.
 
+### And the one that killed the panel for good
+
+Later the same night the panel died and would not come back. `ekran -1` kept
+saying "already running" while **no `ekran` process existed at all.**
+
+```
+/proc/*/fd scan  ->  23135 holds /data/sirsch/ekran.kilit
+                     cmd  = sirsch-bt.sh scan
+                     wchan= sysfs_addrm_finish   (uninterruptible, D state)
+```
+
+The chain:
+
+1. `ekran` forks for scans and for running jobs.
+2. The child inherits open descriptors — including the single-instance lock,
+   whose fd is deliberately kept open so the lock drops when the process dies.
+3. The Bluetooth script wedged in the kernel writing to `rfkill`. **SIGKILL did
+   not touch it** — you cannot signal a process blocked in D state.
+4. As long as that process held the descriptor, `ekran` could never start.
+
+So the panel's own lock, leaked into a child the panel forked, locked the panel
+out permanently — and the trigger was a user tapping "bt".
+
+Two fixes: the lock fd is now `O_CLOEXEC`, so children never see it; and every
+hardware touch in the Bluetooth path is wrapped in `timeout`, so a child cannot
+wedge in the first place.
+
+**A lock that leaks into your own children is not a lock.**
+
 ### What the device can and cannot do now
 
 Measured on the handset, not extrapolated:
