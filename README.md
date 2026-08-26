@@ -52,6 +52,7 @@ these. This is the list I wish I had found.
 | 10 | WiFi enabled, `wlan0` DOWN, `wpa_supplicant` never starts, `/data/misc/wifi/` empty | **Two** independent causes, see below | see below |
 | 11 | Handset powers itself off ~50 s into **every** boot; `last_kmsg` shows `init: Received sys.powerctl='shutdown,thermal,battery' from pid: N (system_server)` while the battery sysfs reads 27 °C | `/sys/class/power_supply` has **three** nodes whose `type` is `Battery`. `BatteryMonitor::init()` walks them in readdir order and takes the first that answers per field, so which one wins is undefined. Here it took `sec-fuelgauge`, whose `temp` is not a temperature: `-1066830336` is `0xC0640000`, the raw IEEE-754 bits of `-3.5625`. When that garbage carried a positive sign the framework read tens of thousands of degrees and `BatteryService.shutdownIfOverTempLocked()` did its job | Board-specific `libhealthd.<device>` that names the bad nodes in `ignorePowerSupplyNames` **and** pins every `battery*Path` explicitly. Raising `config_shutdownBatteryTemperature` does **not** work - no threshold survives a float's bit pattern |
 | 12 | Handset still powers itself off ~50 s into every boot **after** the health HAL is fixed and `dumpsys battery` agrees with sysfs to the digit | `BatteryService` was still starting `ShutdownActivity`. Neither of its two conditions could be true (level 49, temperature 351 against a 3000 threshold verified with `aapt2 dump resources`), and `last_kmsg` could not say otherwise because SELinux-permissive audit spam had overwritten everything before the 50 s mark - and Android 10's `init` logs `Received sys.powerctl` to logd, not kmsg, once logd is up | Write logcat to a file under `/data`: init unmounts it *cleanly* during shutdown, so the file survives. The trigger was in it: `ActivityTaskManager: START u0 {act=…REQUEST_SHUTDOWN cmp=…ShutdownActivity} from uid 1000` followed by `ShutdownActivity: onCreate(): confirm=false` - `confirm=false` is `BatteryService.startShutdownActivity()`'s signature and nothing else in the tree sends that intent |
+| 13 | WiFi never comes up; `wpa_supplicant` logs `Successfully initialized` and then `Terminating...` 16 ms later | The supplicant did not decide that. `Supplicant::terminate()` is a HIDL method - somebody *called* it, and it was the framework cleaning up after a failure two layers below: `wificond: No usable interface found`. This driver (bcmdhd 1.28.19.9) does not put `NL80211_ATTR_MAC` in its `NL80211_CMD_GET_INTERFACE` reply, and wificond skips any interface whose MAC it cannot read - so it skipped both wlan0 and p2p0 and concluded there were none | Read the MAC from `/sys/class/net/<if>/address` when nl80211 does not supply it (`patches/09`). After the fix, on the device: `nl80211 gave no MAC for wlan0; read it from sysfs instead` followed by `create scanner for interface with index: 11` |
 
 ### 10, in detail — because this one is worth its own section
 
@@ -311,6 +312,36 @@ logcat -b main -b system -b crash -v time > /data/sirsch/son.log &
 # after the next boot
 grep -nE 'ShutdownThread|REQUEST_SHUTDOWN|Shutting down' /data/sirsch/son.log
 ```
+
+
+## The symptom three layers from the fault
+
+`wpa_supplicant: Terminating...` is the kind of log line that decides an
+investigation, and here it was pointing at the wrong process entirely.
+
+It reads as the supplicant giving up. It is not: `Terminating...` is printed
+inside `Supplicant::terminate()`, and that is a **HIDL method** - a thing other
+processes call on you. The supplicant was killed, politely, by the framework,
+while the framework was unwinding a failure that had happened two layers
+further down and eight milliseconds earlier:
+
+```
+WificondControl: Setting up interface for client mode
+wificond: Failed to get interface mac address        (twice)
+wificond: No usable interface found                  <- the actual fault
+WificondControl: Could not get IClientInterface instance from wificond
+WifiNative: Failed to setup iface in wificond
+SupplicantStaIfaceHal: Can't call teardownIface, ISupplicantStaIface is null
+SupplicantStaIfaceHal: Terminating supplicant using HIDL
+```
+
+Everything from line four down is cleanup. Reading the log backwards from the
+loudest line meant a day spent on the supplicant, which was innocent.
+
+The check that costs nothing: when a message says a component stopped, find out
+whether it stopped *itself*. Grep the source for the string. If it lives inside
+a method that something else can call, the message is a report about somebody
+else's decision.
 
 
 ## Layout

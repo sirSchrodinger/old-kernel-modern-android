@@ -1,0 +1,92 @@
+wificond: read the interface MAC from sysfs when nl80211 does not supply it
+
+system/connectivity/wificond/net/netlink_utils.cpp, NetlinkUtils::GetInterfaces()
+
+The bcmdhd 1.28.19.9 driver on this kernel does not put NL80211_ATTR_MAC in its
+NL80211_CMD_GET_INTERFACE reply.  wificond skipped every interface that had no
+MAC, ended with "No usable interface found", and from there the teardown reads
+like a supplicant problem three layers away:
+
+    WificondControl: Setting up interface for client mode
+    wificond: Failed to get interface mac address        (x2)
+    wificond: No usable interface found
+    WificondControl: Could not get IClientInterface instance from wificond
+    WifiNative: Failed to setup iface in wificond
+    SupplicantStaIfaceHal: Can't call teardownIface, ISupplicantStaIface is null
+    SupplicantStaIfaceHal: Terminating supplicant using HIDL
+
+The visible symptom was "wpa_supplicant starts and dies 16 ms later".  It is
+worth knowing that this line is not the supplicant's own decision:
+Supplicant::terminate() is a HIDL method, so somebody called it - the framework
+did, while cleaning up after wificond had already failed.
+
+The MAC is in sysfs the whole time (measured: wlan0 f0:72:8c:af:53:ee,
+p2p0 f2:72:8c:af:53:ee).  What netlink will not say, the kernel is already
+saying somewhere else.
+
+--- a/system/connectivity/wificond/net/netlink_utils.cpp
++++ b/system/connectivity/wificond/net/netlink_utils.cpp
+
+Added includes: android-base/file.h, android-base/parseint.h, android-base/strings.h
+
+Added in an anonymous namespace:
+
+namespace {
+
+// nl80211 vermezse MAC'i sysfs'ten oku.
+//
+// Bu cekirdegin bcmdhd surucusu (1.28.19.9) NL80211_CMD_GET_INTERFACE
+// yanitina NL80211_ATTR_MAC koymuyor.  wificond bunu goremeyince arayuzu
+// atliyordu, iki arayuz de atlaninca "No usable interface found" diyordu, ve
+// oradan asagisi comert bir yikim zinciri: WifiNative iface uretemiyor,
+// SupplicantStaIfaceHal teardown'da null goruyor, sonunda framework
+// supplicant'i HIDL uzerinden sonlandiriyor.  Disaridan bakildiginda belirti
+// "wpa_supplicant basliyor ve 16 ms sonra oluyor" - yani asil hatanin iki
+// katman uzagi.
+//
+// Oysa MAC her zaman /sys/class/net/<ad>/address altinda duruyor; olculdu:
+// wlan0 f0:72:8c:af:53:ee, p2p0 f2:72:8c:af:53:ee.  Netlink'in soylemedigi
+// seyi cekirdek zaten baska bir yerden soyluyor.
+bool ReadMacFromSysfs(const std::string& if_name,
+                      std::array<uint8_t, ETH_ALEN>* mac) {
+  std::string path = "/sys/class/net/" + if_name + "/address";
+  std::string content;
+  if (!android::base::ReadFileToString(path, &content)) {
+    return false;
+  }
+  std::vector<std::string> parts =
+      android::base::Split(android::base::Trim(content), ":");
+  if (parts.size() != ETH_ALEN) {
+    return false;
+  }
+  for (size_t i = 0; i < ETH_ALEN; i++) {
+    uint32_t byte = 0;
+    // Alan onaltilik ve iki hane; hatali bir satiri kabul etmektense
+    // basarisiz olmak dogru - yanlis MAC, MAC'siz olmaktan kotu.
+    if (!android::base::ParseUint(("0x" + parts[i]).c_str(), &byte) ||
+        byte > 0xff) {
+      return false;
+    }
+    (*mac)[i] = static_cast<uint8_t>(byte);
+  }
+  return true;
+}
+
+}  // namespace
+
+And in GetInterfaces(), replacing the bare `continue`:
+
+    array<uint8_t, ETH_ALEN> if_mac_addr;
+    if (!packet->GetAttributeValue(NL80211_ATTR_MAC, &if_mac_addr)) {
+      // golden: nl80211 bu surucude MAC vermiyor - sysfs'ten oku.
+      // Atlamak, arayuzu tamamen kaybetmek demek (bkz. ReadMacFromSysfs).
+      if (!ReadMacFromSysfs(if_name, &if_mac_addr)) {
+        LOG(WARNING) << "Failed to get interface mac address for " << if_name
+                     << " (nl80211 and sysfs both failed)";
+        continue;
+      }
+      LOG(INFO) << "nl80211 gave no MAC for " << if_name
+                << "; read it from sysfs instead";
+    }
+
+    
