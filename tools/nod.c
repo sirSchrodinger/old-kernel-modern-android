@@ -434,6 +434,89 @@ static void dosya_ver(int s, const char *yol, const char *tur) {
     gonder(s, "200 OK", tur, buf, (size_t)k);
 }
 
+
+/* Tarayicidan bakildiginda ne gorunecegi.
+ *
+ * Tek dosya, dis kaynak yok: bu telefon cogu zaman evin agina bile bagli
+ * degil, rndis ucundaki tek IP olabiliyor.  CDN'den font ceken bir sayfa tam
+ * ihtiyac duyuldugu anda bos ekran olur.
+ *
+ * Pil kismi bilerek uc sayi gosteriyor.  Bu cihazin yakit olceri uyduruyor
+ * (bir oturumda %46 -> %28 -> %29), o yuzden tek bir yuzde gostermek okuyanı
+ * yanlis bir kesinlige ikna etmek olurdu.  Olcerin dedigi, gerilimden
+ * turetilen ve ikisinin farki yan yana duruyor; anlasmiyorlarsa bunu sayfa
+ * kendisi soyluyor. */
+static const char *SAYFA =
+"<!doctype html><html lang='tr'><head><meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>golden nod</title><style>"
+":root{--z:#faf9f7;--y:#1b1a18;--k:#6b6862;--c:#d9d5cd;--i:#2f6f4f;--u:#a8442a}"
+"@media(prefers-color-scheme:dark){:root{--z:#141412;--y:#eceae5;--k:#8f8b83;--c:#2c2a26;--i:#63b98c;--u:#e0785a}}"
+"*{box-sizing:border-box}body{margin:0;padding:18px;background:var(--z);color:var(--y);"
+"font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}"
+"h1{font-size:15px;margin:0 0 2px;letter-spacing:.06em;text-transform:uppercase}"
+".alt{color:var(--k);font-size:12px;margin:0 0 16px}"
+".k{border:1px solid var(--c);border-radius:5px;padding:12px 14px;margin:0 0 12px}"
+".k h2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--k);margin:0 0 9px;font-weight:600}"
+"table{width:100%;border-collapse:collapse}td{padding:2px 0;vertical-align:top}"
+"td:first-child{color:var(--k);width:48%}td:last-child{text-align:right;font-variant-numeric:tabular-nums}"
+".b{color:var(--i)}.f{color:var(--u)}"
+"canvas{width:100%;height:70px;display:block}"
+"</style></head><body>"
+"<h1>golden nod</h1><p class='alt' id='alt'>yukleniyor...</p>"
+"<div class='k'><h2>pil</h2><table id='pil'></table></div>"
+"<div class='k'><h2>gerilim &mdash; son kayitlar</h2><canvas id='g'></canvas></div>"
+"<div class='k'><h2>islemci</h2><table id='cpu'></table></div>"
+"<div class='k'><h2>sistem</h2><table id='sis'></table></div>"
+"<div class='k'><h2>ag</h2><table id='ag'></table></div>"
+"<script>\n"
+"const q=s=>document.getElementById(s);\n"
+"const sat=(t,r)=>{t.innerHTML=r.map(([a,b,c])=>"
+"`<tr><td>${a}</td><td class='${c||\"\"}'>${b}</td></tr>`).join('')};\n"
+"function sure(s){s=Math.floor(s);const g=Math.floor(s/86400),h=Math.floor(s%86400/3600),"
+"d=Math.floor(s%3600/60);return (g?g+'g ':'')+(h||g?h+'s ':'')+d+'dk'}\n"
+"async function tazele(){\n"
+" try{\n"
+"  const d=await (await fetch('/durum',{cache:'no-store'})).json();\n"
+"  q('alt').textContent=d.sistem.utc+' UTC \\u00b7 ayakta '+sure(d.sistem.uptime_sn);\n"
+"  const p=d.pil, uy=p.olcer_guvenilir===false;\n"
+"  sat(q('pil'),[\n"
+"   ['gerilim',p.gerilim_mv+' mV'],\n"
+"   ['gerilimden yuzde',p.yuzde_gerilimden+'%'],\n"
+"   ['olcerin dedigi',p.yuzde_olcerden+'%',uy?'f':''],\n"
+"   ['fark',(p.fark>0?'+':'')+p.fark+' puan',uy?'f':'b'],\n"
+"   ['olcere guvenilir mi',uy?'HAYIR':'evet',uy?'f':'b'],\n"
+"   ['durum',p.durum||'-',p.sarj_oluyor?'b':''],\n"
+"   ['sicaklik',(p.sicaklik_ondC/10).toFixed(1)+' \\u00b0C',p.sicaklik_makul?'':'f'],\n"
+"   ['sicaklik makul mu',p.sicaklik_makul?'evet':'HAYIR',p.sicaklik_makul?'b':'f']]);\n"
+"  sat(q('cpu'),d.cpu.cekirdekler.map(c=>['cekirdek '+c.no,\n"
+"   (c.acik?(c.khz/1000)+' MHz \\u00b7 '+c.governor:'KAPALI'),c.acik?'':'f'])\n"
+"   .concat([['yuk',d.cpu.yuk.split(' ').slice(0,3).join(' ')]]));\n"
+"  sat(q('sis'),[['ram bos',Math.round(d.sistem.ram_bos_kb/1024)+' / '+\n"
+"   Math.round(d.sistem.ram_toplam_kb/1024)+' MiB'],['surec',d.sistem.surec],\n"
+"   ['kalkan modu',d.sistem.kalkan?'ACIK':'kapali',d.sistem.kalkan?'f':''],\n"
+"   ['isi',(d.isi||[]).map(z=>z.tur+'='+z.deger).join(' ')||'-']]);\n"
+"  sat(q('ag'),d.ag.arayuzler.filter(a=>a.ad!=='lo')\n"
+"   .map(a=>[a.ad,a.durum,a.durum==='up'?'b':'']));\n"
+" }catch(e){q('alt').textContent='durum alinamadi: '+e}\n"
+" try{\n"
+"  const t=await (await fetch('/gecmis',{cache:'no-store'})).text();\n"
+"  const v=t.split('\\n').filter(l=>l&&l[0]!=='#').map(l=>+l.split(' ')[2]).filter(x=>x>1000);\n"
+"  const c=q('g'),x=c.getContext('2d'),W=c.width=c.clientWidth*2,H=c.height=140;\n"
+"  x.clearRect(0,0,W,H); if(v.length<2)return;\n"
+"  const mn=Math.min(...v),mx=Math.max(...v),d2=(mx-mn)||1;\n"
+"  x.strokeStyle=getComputedStyle(document.body).getPropertyValue('--i');\n"
+"  x.lineWidth=2; x.beginPath();\n"
+"  v.forEach((y,i)=>{const px=i/(v.length-1)*W,py=H-8-(y-mn)/d2*(H-22);\n"
+"   i?x.lineTo(px,py):x.moveTo(px,py)}); x.stroke();\n"
+"  x.fillStyle=getComputedStyle(document.body).getPropertyValue('--k');\n"
+"  x.font='20px monospace'; x.fillText((mx/1000).toFixed(2)+'V',4,18);\n"
+"  x.fillText((mn/1000).toFixed(2)+'V',4,H-4);\n"
+" }catch(e){}\n"
+"}\n"
+"tazele(); setInterval(tazele,10000);\n"
+"</script></body></html>\n";
+
 static const char *KOK_SAYFA =
     "golden nod\n"
     "\n"
@@ -443,6 +526,7 @@ static const char *KOK_SAYFA =
     "  /kmesg    cekirdek halka tamponu (son 64 KB)\n"
     "  /wifi     wifi kurulum gunlugu\n"
     "  /saglik   tek satir: ayakta miyim\n"
+    "  /         tarayici icin durum sayfasi\n"
     "\n"
     "Pil hakkinda: bu cihazin yakit olceri uyduruyor.  /durum yuzdeyi TEK bir\n"
     "sayi olarak vermez - olcerin dedigini, gerilimden turetileni ve ikisinin\n"
@@ -501,7 +585,8 @@ int main(int argc, char **argv) {
         char *son = strpbrk(yol, " ?\r\n");
         if (son) *son = 0;
 
-        if (!strcmp(yol, "/") )              gonder(s, "200 OK", "text/plain; charset=utf-8", KOK_SAYFA, strlen(KOK_SAYFA));
+        if (!strcmp(yol, "/") )              gonder(s, "200 OK", "text/html; charset=utf-8", SAYFA, strlen(SAYFA));
+        else if (!strcmp(yol, "/yardim"))    gonder(s, "200 OK", "text/plain; charset=utf-8", KOK_SAYFA, strlen(KOK_SAYFA));
         else if (!strcmp(yol, "/durum"))     durum_ver(s);
         else if (!strcmp(yol, "/saglik"))    gonder(s, "200 OK", "text/plain", "ayakta\n", 7);
         else if (!strcmp(yol, "/gecmis"))    gecmis_ver(s);
