@@ -3,7 +3,7 @@
 `ekran` veriyi **nereden geldiğini bilmeden** çizer. Bir şey `/data/sirsch/panel/`
 altına düz metin bırakır, ekran onu sayfa olarak gösterir. Kaynağın ne olduğu
 ekranı ilgilendirmez: sera'nın HTTP API'si, USB'den seri konuşan bir Arduino,
-kaplikaya'dan gelen bir rsync, ya da telefonun kendi sensörü — hepsi aynı
+ev sunucusundan gelen bir rsync, ya da telefonun kendi sensörü — hepsi aynı
 dosyayı yazar.
 
 Bu ayrımın sebebi: veri kaynağı değiştiğinde çizim kodunun değişmemesi gerekiyor.
@@ -13,7 +13,7 @@ Bu ayrımın sebebi: veri kaynağı değiştiğinde çizim kodunun değişmemesi
 Sıra numarası sayfa sırasını belirler (`10-sera.pnl`, `20-devre.pnl`).
 
 ```
-baslik Sera — Orhangazi
+baslik Sera
 tazelik 42                      # kaç saniye önce güncellendi
 deger sicaklik 24,3 °C
 deger nem 61 %
